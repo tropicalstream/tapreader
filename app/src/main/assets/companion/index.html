@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#12191b">
+  <title>TapReader Companion</title>
+  <link rel="stylesheet" href="/companion.css">
+</head>
+<body>
+  <main class="app-shell">
+    <aside class="rail">
+      <div class="brand"><span class="brand-mark">T</span><span>TapReader</span></div>
+      <nav aria-label="Companion sections">
+        <button class="nav-item active" data-view="library">Library</button>
+        <button class="nav-item" data-view="getbooks">Get free books</button>
+        <button class="nav-item" data-view="coach">Reading coach</button>
+        <button class="nav-item" data-view="voices">Narration voices</button>
+        <button class="nav-item" data-view="nas">Import from NAS</button>
+        <button class="nav-item" data-view="settings">Settings</button>
+      </nav>
+      <div class="rail-status" id="connection-label">Not connected</div>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Local companion</p>
+          <h1 id="page-title">Your library</h1>
+        </div>
+        <div class="connect-control">
+          <label class="sr-only" for="glasses-url">Glasses address</label>
+          <input id="glasses-url" inputmode="url" autocomplete="url" placeholder="http://192.168.x.x:8787">
+          <button class="icon-button" id="connect" title="Connect to glasses" aria-label="Connect to glasses">Connect</button>
+        </div>
+      </header>
+
+      <div id="notice" class="notice" role="status" hidden></div>
+
+      <section class="view active" id="library-view">
+        <div class="metrics" id="metrics"></div>
+        <div class="section-header library-tools">
+          <div>
+            <h2>Books on your glasses</h2>
+            <p>Progress and covers sync directly over your local network.</p>
+          </div>
+          <div class="tool-cluster">
+            <label class="search-field"><span class="sr-only">Search books</span><input id="book-search" placeholder="Search title or author"></label>
+            <label class="file-button">Add book<input type="file" id="book-upload" accept=".epub,.pdf,.txt,.md,.html,.htm,.fb2,.rtf,.docx" hidden></label>
+          </div>
+        </div>
+        <div class="filter-row" id="book-filters">
+          <button class="filter active" data-filter="all">All</button>
+          <button class="filter" data-filter="reading">In progress</button>
+          <button class="filter" data-filter="unread">Unread</button>
+          <button class="filter" data-filter="finished">Finished</button>
+        </div>
+        <div class="book-grid" id="book-grid"></div>
+        <div id="archived-block" hidden>
+          <div class="section-header"><div><h2>Off the glasses</h2><p>Removed from the glasses but kept safe here, progress included. Restore to read again, or delete forever.</p></div></div>
+          <div class="book-grid" id="archived-grid"></div>
+        </div>
+      </section>
+
+      <section class="view" id="getbooks-view">
+        <div class="section-header"><div><h2>Get free books</h2><p>Search legitimate free catalogs from this computer; the glasses download the book directly over Wi-Fi.</p></div></div>
+        <form class="source-form" id="source-form">
+          <select id="source-pick" aria-label="Catalog">
+            <option value="gutenberg">Project Gutenberg</option>
+            <option value="standardebooks">Standard Ebooks</option>
+          </select>
+          <label class="search-field"><span class="sr-only">Search books</span><input id="source-query" placeholder="Title or author — leave blank for popular books"></label>
+          <button type="submit">Search</button>
+        </form>
+        <div class="book-grid" id="source-results"></div>
+        <div class="section-header"><div><h2>More places to find books</h2><p>Open these on this computer, then send downloaded files to the glasses with “Add book” in the Library.</p></div></div>
+        <div class="repo-list" id="source-repos"></div>
+      </section>
+
+      <section class="view" id="coach-view">
+        <div class="section-header">
+          <div><h2>Reading coach</h2><p>Recaps what you have actually read, then offers spoiler-safe encouragement for what lies ahead.</p></div>
+        </div>
+        <div class="coach-layout">
+          <div class="coach-select" id="coach-books"></div>
+          <article class="coach-card" id="coach-output">
+            <p class="coach-empty">Choose a book, then ask the coach for a careful recap.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="voices-view">
+        <div class="section-header">
+          <div><h2>Narration voices</h2><p>Search the fish.audio voice library, preview any voice, and keep up to five on your glasses. The selected voice narrates your books.</p></div>
+        </div>
+
+        <div class="voice-block">
+          <div class="voice-block-head"><h3>Saved on your glasses</h3><span class="voice-count" id="voice-count"></span></div>
+          <div class="voice-list" id="voice-list"></div>
+        </div>
+
+        <div class="voice-block">
+          <h3>Find a voice on fish.audio</h3>
+          <form class="voice-finder" id="voice-finder">
+            <label class="search-field"><span class="sr-only">Search the fish.audio voice library</span><input id="voice-query" placeholder="Search voices — e.g. calm narrator, deep male, British"></label>
+            <button type="submit">Search</button>
+          </form>
+          <div class="voice-results" id="voice-results"><p class="empty">Search the library to preview and add voices.</p></div>
+          <details class="add-voice-manual">
+            <summary>Add by reference ID instead</summary>
+            <form class="add-voice" id="add-voice">
+              <label>Name<input required name="name" maxlength="40" placeholder="e.g. Warm narrator"></label>
+              <label>fish.audio reference ID<input required name="id" placeholder="Paste voice reference ID"></label>
+              <button type="submit">Save voice</button>
+            </form>
+          </details>
+        </div>
+      </section>
+
+      <section class="view" id="nas-view">
+        <div class="section-header"><div><h2>Import from NAS</h2><p>Enter your NAS address, connect, and browse its folders from the root. The glasses connect and copy the file — your NAS password stays on your LAN and is never saved.</p></div></div>
+        <form class="settings-form" id="nas-form">
+          <section class="settings-group"><h3>Connection</h3>
+            <label>Host or IP<input name="host" placeholder="192.168.1.10"></label>
+            <label>Username<input name="user" placeholder="(blank = guest)" autocomplete="off"></label>
+            <label>Password<input name="pass" type="password" autocomplete="off" placeholder="(if required)"></label>
+            <button type="submit">Connect</button>
+          </section>
+        </form>
+        <div class="nas-path" id="nas-path" hidden></div>
+        <div class="nas-list" id="nas-list"></div>
+      </section>
+
+      <section class="view" id="settings-view">
+        <div class="section-header"><div><h2>Glasses settings</h2><p>Changes save on the glasses and are applied the next time the reader uses them.</p></div></div>
+        <form class="settings-form" id="settings-form">
+          <section class="settings-group"><h3>Reader</h3>
+            <label>Glasses name<input name="deviceName" maxlength="40"></label>
+            <label>Font size <output id="font-output"></output><input name="fontSp" type="range" min="12" max="40" step="1"></label>
+            <label>Reading speed <output id="wpm-output"></output><input name="wpm" type="range" min="80" max="900" step="20"></label>
+            <label>Daily word goal<input name="dailyGoal" type="number" min="200" max="20000" step="200"></label>
+            <label>Theme<select name="theme"><option value="0">Amber</option><option value="1">White</option><option value="2">Green</option></select></label>
+            <label>Default mode<select name="mode"><option value="0">Page</option><option value="1">Auto-scroll</option><option value="2">One word</option></select></label>
+            <label class="toggle"><input name="topHud" type="checkbox">Show top status HUD</label>
+          </section>
+          <section class="settings-group"><h3>Private API keys</h3>
+            <p class="small-copy">Paste a key, then press <strong>Save &amp; test</strong> — the glasses try it live and keep it only if it works. Keys stay on the glasses; saved values show as asterisks and are never sent back to this browser.</p>
+            <label>fish.audio key<input name="fish" type="password" autocomplete="new-password" placeholder="Not set"></label>
+            <div class="key-row"><button type="button" class="test-key" data-test-key="fish">Save &amp; test fish.audio key</button><span class="key-status" id="key-status-fish"></span></div>
+            <label>Gemini API key<input name="gemini" type="password" autocomplete="new-password" placeholder="Not set"></label>
+            <div class="key-row"><button type="button" class="test-key" data-test-key="gemini">Save &amp; test Gemini key</button><span class="key-status" id="key-status-gemini"></span></div>
+            <p class="small-copy">Use a Gemini key restricted to the Gemini API. The coach sends only the already-read passage.</p>
+          </section>
+          <button type="submit">Save and sync settings</button>
+        </form>
+      </section>
+    </section>
+  </main>
+  <dialog id="confirm-dialog"><form method="dialog"><h2 id="confirm-title">Confirm</h2><p id="confirm-message"></p><div class="dialog-actions"><button value="cancel">Cancel</button><button id="confirm-action" value="confirm">Confirm</button></div></form></dialog>
+  <dialog id="info-dialog"><h2 id="info-title"></h2><div id="info-body"></div><form method="dialog" class="dialog-actions"><button>Close</button></form></dialog>
+  <dialog id="cover-dialog">
+    <h2>Find a cover</h2>
+    <p class="small-copy">Covers come from Open Library. Edit the search words if the matches are wrong — try adding the series name, or removing subtitles.</p>
+    <form id="cover-form" class="cover-form"><input id="cover-query" placeholder="title author keywords"><button type="submit">Search</button></form>
+    <div id="cover-results" class="cover-results"></div>
+    <form method="dialog" class="dialog-actions"><button>Close</button></form>
+  </dialog>
+  <script src="/companion.js"></script>
+</body>
+</html>
