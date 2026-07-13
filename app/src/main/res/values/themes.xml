@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.TapReader" parent="android:Theme.DeviceDefault.NoActionBar.Fullscreen">
+        <item name="android:windowBackground">@color/reader_bg</item>
+        <item name="android:statusBarColor">@color/reader_bg</item>
+        <item name="android:navigationBarColor">@color/reader_bg</item>
+    </style>
+</resources>
