@@ -206,6 +206,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
 
         buildConfirmOverlay()
         buildTocOverlay()
+        buildBookMenuOverlay()
 
         viewport = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -220,6 +221,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             addView(statusPill)
             addView(keyboardContainer)
             addView(tocOverlay, match())
+            addView(bookMenuOverlay, match())
             addView(confirmOverlay, match())   // topmost — mirrors to both eyes
         }
 
@@ -238,6 +240,9 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
     private lateinit var confirmOverlay: FrameLayout
     private lateinit var confirmMessage: TextView
     private lateinit var confirmYes: Button
+    private lateinit var confirmNo: Button
+    // Focus for cursor-free contexts (library): 0 = Cancel (safe default), 1 = Confirm.
+    private var confirmFocus = 0
 
     private fun buildConfirmOverlay() {
         confirmMessage = TextView(this).apply {
@@ -248,11 +253,12 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             text = "Confirm"; isAllCaps = false; textSize = 15f
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(dp(4), 0, dp(4), 0) }
         }
-        val cancel = Button(this).apply {
+        confirmNo = Button(this).apply {
             text = "Cancel"; isAllCaps = false; textSize = 15f
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(dp(4), 0, dp(4), 0) }
             setOnClickListener { hideConfirm() }
         }
+        val cancel = confirmNo
         val buttons = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(cancel); addView(confirmYes)
@@ -281,11 +287,153 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
         confirmMessage.text = message
         confirmYes.text = confirmLabel
         confirmYes.setOnClickListener { hideConfirm(); onConfirm() }
+        confirmFocus = 0            // safe default: Cancel
+        applyConfirmFocus()
         confirmOverlay.visibility = View.VISIBLE
         confirmOverlay.bringToFront()
     }
 
+    private fun applyConfirmFocus() {
+        listOf(confirmNo, confirmYes).forEachIndexed { i, b ->
+            val focused = i == confirmFocus
+            b.background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(9).toFloat()
+                setColor(if (focused) 0xFF4B4829.toInt() else 0xFF1B2026.toInt())
+                setStroke(dp(if (focused) 2 else 1), if (focused) 0xFFFFC466.toInt() else 0xFF30363D.toInt())
+            }
+            b.setTextColor(if (focused) 0xFFFFF3C4.toInt() else 0xFFD8DEE9.toInt())
+        }
+    }
+
+    private fun stepConfirmFocus(delta: Int) {
+        confirmFocus = (confirmFocus + delta).mod(2)
+        applyConfirmFocus()
+    }
+
     private fun hideConfirm() { confirmOverlay.visibility = View.GONE }
+
+    // ---- Book action submenu (library is cursor-free: swipe selects, tap acts,
+    // ---- double-tap closes) --------------------------------------------------
+
+    private lateinit var bookMenuOverlay: FrameLayout
+    private lateinit var bookMenuCard: LinearLayout
+    private val bookMenuItems = mutableListOf<Button>()
+    private var bookMenuFocus = 0
+
+    private fun buildBookMenuOverlay() {
+        bookMenuCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(16), dp(18), dp(14))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xFF161B22.toInt()); cornerRadius = dp(14).toFloat()
+                setStroke(dp(1), 0xFF30363D.toInt())
+            }
+            val lp = FrameLayout.LayoutParams(dp(300), FrameLayout.LayoutParams.WRAP_CONTENT)
+            lp.gravity = Gravity.CENTER; layoutParams = lp
+        }
+        bookMenuOverlay = FrameLayout(this).apply {
+            setBackgroundColor(0xCC000000.toInt())
+            isClickable = true
+            visibility = View.GONE
+            addView(bookMenuCard)
+        }
+    }
+
+    private fun showBookMenu(item: Shelf) {
+        bookMenuCard.removeAllViews()
+        bookMenuItems.clear()
+        bookMenuCard.addView(TextView(this).apply {
+            text = item.title.take(48); textSize = 15f; setTextColor(Color.WHITE)
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setPadding(dp(4), 0, dp(4), dp(10)); maxLines = 2
+        })
+        fun option(label: String, onPick: () -> Unit) {
+            val b = Button(this).apply {
+                text = label; isAllCaps = false; textSize = 14f
+                stateListAnimator = null
+                gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                    .apply { setMargins(0, dp(3), 0, dp(3)) }
+                setOnClickListener { hideBookMenu(); onPick() }
+            }
+            bookMenuItems += b
+            bookMenuCard.addView(b)
+        }
+        option("📖  Open") { requestOpenBook(item.fileName) }
+        option("↩  Reset progress") {
+            showConfirm("Reset progress for “${item.title.take(40)}”?", "Reset") {
+                library.resetProgress(item.fileName)
+                if (bookFile == item.fileName) { actualReadPosition = 0; actualWordsRead = 0 }
+                refreshLibrary(); flash("Progress reset")
+            }
+        }
+        option("🗑  Remove from glasses") {
+            showConfirm("Remove “${item.title.take(40)}” from the glasses? It stays in the companion, ready to restore.", "Remove") {
+                library.archive(item.fileName); refreshLibrary(); flash("Moved off the glasses — restore it from the companion")
+            }
+        }
+        bookMenuCard.addView(TextView(this).apply {
+            text = "swipe · tap to choose · double-tap to close"
+            textSize = 11f; setTextColor(0xFF6E7A85.toInt()); gravity = Gravity.CENTER
+            setPadding(0, dp(8), 0, 0)
+        })
+        bookMenuFocus = 0
+        applyBookMenuFocus()
+        bookMenuOverlay.visibility = View.VISIBLE
+        bookMenuOverlay.bringToFront()
+    }
+
+    private fun hideBookMenu() { bookMenuOverlay.visibility = View.GONE }
+
+    private fun applyBookMenuFocus() {
+        bookMenuItems.forEachIndexed { i, b ->
+            val focused = i == bookMenuFocus
+            b.background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(9).toFloat()
+                setColor(if (focused) 0xFF4B4829.toInt() else 0xFF1B2026.toInt())
+                setStroke(dp(if (focused) 2 else 1), if (focused) 0xFFFFC466.toInt() else 0xFF30363D.toInt())
+            }
+            b.setTextColor(if (focused) 0xFFFFF3C4.toInt() else 0xFFD8DEE9.toInt())
+        }
+    }
+
+    private fun stepBookMenuFocus(delta: Int) {
+        if (bookMenuItems.isEmpty()) return
+        bookMenuFocus = (bookMenuFocus + delta).mod(bookMenuItems.size)
+        applyBookMenuFocus()
+    }
+
+    // ---- Library focus (no cursor on this screen) -----------------------------
+
+    private val libItems = mutableListOf<View>()
+    private var libFocus = 0
+
+    private fun registerLibItem(v: View) { libItems += v }
+
+    private fun applyLibFocus() {
+        libFocus = libFocus.coerceIn(0, (libItems.size - 1).coerceAtLeast(0))
+        libItems.forEachIndexed { i, v ->
+            v.foreground = if (i == libFocus) android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(9).toFloat()
+                setColor(0x22FFC466)
+                setStroke(dp(2), 0xFFFFC466.toInt())
+            } else null
+        }
+        // Keep the focused item on screen (edge-scroll is retired here).
+        libItems.getOrNull(libFocus)?.let { v ->
+            var y = 0; var cur: View = v
+            while (cur !== libraryList && cur.parent is View) { y += cur.top; cur = cur.parent as View }
+            libraryPanel.smoothScrollTo(0, (y - dp(70)).coerceAtLeast(0))
+        }
+    }
+
+    private fun stepLibFocus(delta: Int) {
+        if (libItems.isEmpty()) return
+        libFocus = (libFocus + delta).mod(libItems.size)
+        applyLibFocus()
+    }
 
     // ---- Table-of-contents overlay (mirrored to both eyes) ------------------
 
@@ -415,7 +563,12 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
 
     // Always rebuild on entry: books can arrive over Wi-Fi at any moment, and a
     // stale list here looks like the companion "didn't sync".
-    private fun showLibrary() { screen = Screen.LIBRARY; showOnly(libraryPanel); controlBar.visibility = View.GONE; hideKeyboard(); refreshLibrary(); refreshHud() }
+    private fun showLibrary() {
+        screen = Screen.LIBRARY; showOnly(libraryPanel); controlBar.visibility = View.GONE
+        hideKeyboard(); hideBookMenu()
+        libFocus = 0
+        refreshLibrary(); refreshHud()
+    }
     private fun showReader() { screen = Screen.READER; showOnly(reader); reader.bringToFront(); controlBar.bringToFront(); topHud.bringToFront(); statusPill.bringToFront(); refreshHud() }
     private fun showGetBooks() { screen = Screen.GET_BOOKS; showOnly(getBooksPanel); controlBar.visibility = View.GONE; refreshHud() }
     private fun showSettings() { screen = Screen.SETTINGS; showOnly(settingsPanel); controlBar.visibility = View.GONE; refreshSettings(); refreshHud() }
@@ -424,6 +577,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
 
     private fun refreshLibrary() {
         libraryList.removeAllViews()
+        libItems.clear()
         val s = library.streak()
         banner.text = encouragement(s)
         libraryList.addView(banner)
@@ -436,9 +590,10 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             libraryList.addView(bookGallery(shelf))
         }
         libraryList.addView(spacer())
-        libraryList.addView(bigButton("🔍  Get free books") { openGetBooks() })
-        libraryList.addView(bigButton("⚙  Settings") { showSettings() })
+        libraryList.addView(bigButton("🔍  Get free books") { openGetBooks() }.also { registerLibItem(it) })
+        libraryList.addView(bigButton("⚙  Settings") { showSettings() }.also { registerLibItem(it) })
         libraryList.addView(hint(deviceInfoLine()))
+        applyLibFocus()
     }
 
     private fun bookGallery(items: List<Shelf>): View {
@@ -468,8 +623,10 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                 setMargins(dp(4), dp(4), dp(4), dp(4))
             }
-            setOnClickListener { requestOpenBook(item.fileName) }
+            // Tap on the focused book opens its action submenu (Open/Reset/Remove).
+            setOnClickListener { showBookMenu(item) }
         }
+        registerLibItem(tile)
         val holder = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(178))
             background = android.graphics.drawable.GradientDrawable().apply {
@@ -497,36 +654,8 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             }
             textSize = 11f; maxLines = 2; setTextColor(0xFF8B949E.toInt())
         })
-        val actions = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-                .apply { topMargin = dp(4) }
-        }
-        actions.addView(Button(this).apply {
-            text = "Reset"; isAllCaps = false; textSize = 10f
-            minWidth = 0; minimumWidth = 0
-            setPadding(dp(4), dp(1), dp(4), dp(1))
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(4) }
-            setOnClickListener {
-                showConfirm("Reset progress for “${item.title.take(40)}”?", "Reset") {
-                    library.resetProgress(item.fileName)
-                    if (bookFile == item.fileName) { actualReadPosition = 0; actualWordsRead = 0 }
-                    refreshLibrary(); flash("Progress reset")
-                }
-            }
-        })
-        actions.addView(Button(this).apply {
-            text = "Delete"; isAllCaps = false; textSize = 10f
-            minWidth = 0; minimumWidth = 0
-            setPadding(dp(4), dp(1), dp(4), dp(1))
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener {
-                showConfirm("Remove “${item.title.take(40)}” from the glasses? It stays in the companion, ready to restore.", "Remove") {
-                    library.archive(item.fileName); refreshLibrary(); flash("Moved off the glasses — restore it from the companion")
-                }
-            }
-        })
-        tile.addView(actions)
+        // Per-tile Reset/Delete buttons are gone: those actions live in the
+        // focus-driven submenu now (tap the highlighted book to open it).
         val cached = covers.cachedCover(item.fileName)
         if (cached != null) {
             image.setImageBitmap(cached); initials.visibility = View.GONE
@@ -594,6 +723,9 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
     /** Play/pause: pauses & resumes narration (keeps TTS on) or the auto-pacer. */
     private fun toggleReading() {
         if (ttsOn) {
+            // An explicit tap supersedes any pending scrub-restart; without this a
+            // delayed restart could land right after a resume → two voices at once.
+            main.removeCallbacks(scrubTtsRestart)
             if (tts.isPaused) { tts.resume(); flash("Narrating…") } else { tts.pause(); flash("Paused") }
             rebuildControlBar()
         } else {
@@ -613,11 +745,12 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
     private fun cycleMode() {
         reader.mode = (reader.mode + 1) % 3
         library.putInt(LibraryStore.K_MODE, reader.mode)
-        flash(when (reader.mode) {
-            ReaderView.MODE_PAGED -> "Mode: Page"
-            ReaderView.MODE_AUTOSCROLL -> "Mode: Auto-scroll"
-            else -> "Mode: One word at a time"
-        })
+        val name = when (reader.mode) {
+            ReaderView.MODE_PAGED -> "Page"
+            ReaderView.MODE_AUTOSCROLL -> "Auto-scroll"
+            else -> "One word at a time"
+        }
+        flash(if (ttsOn) "Mode: $name" else "Mode: $name — tap to read")
     }
 
     private fun afterPlayStateChange() { rebuildControlBar(); if (!reader.isPlaying) saveProgress() }
@@ -640,11 +773,15 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
         reader.pause(); reader.ttsDriven = true
         ttsOn = true
         tts.start(b, reader.focusIndex)
+        // Immediate spoken feedback while the first sentence synthesizes (cached
+        // per voice, so it plays instantly after the first ever use).
+        tts.speakCue("Starting narration")
         flash("Narrating…")
         rebuildControlBar()
     }
 
     private fun stopTts() {
+        main.removeCallbacks(scrubTtsRestart)
         if (tts.isActive) tts.stop()
         reader.ttsDriven = false
         ttsOn = false
@@ -966,8 +1103,19 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             doubleTapHandler = { onDoubleTap() }
             tripleTapHandler = { showSettings() }
             tapInterceptor = { false }
-            menuNavigationActive = { menuNavActive() }
-            horizontalStepHandler = { delta -> stepCtlFocus(delta) }
+            // Focus-driven surfaces: the reader's menu bar AND the whole library
+            // screen (which is cursor-free — swipes move the highlight instead).
+            menuNavigationActive = { menuNavActive() || screen == Screen.LIBRARY }
+            horizontalStepHandler = { delta ->
+                when {
+                    screen == Screen.LIBRARY && confirmOverlay.visibility == View.VISIBLE -> stepConfirmFocus(delta)
+                    screen == Screen.LIBRARY && bookMenuOverlay.visibility == View.VISIBLE -> stepBookMenuFocus(delta)
+                    screen == Screen.LIBRARY -> stepLibFocus(delta)
+                    else -> stepCtlFocus(delta)
+                }
+            }
+            menuDismissHandler = { if (menuNavActive()) hideControlBar() }
+            cursorSuppressed = { screen == Screen.LIBRARY }
             // Don't scrub the reading position while the menu bar or keyboard is up
             // (moving the cursor toward the bottom menu must not advance the word).
             contentInteractionBlocked = { controlBar.visibility == View.VISIBLE || keyboardContainer.visibility == View.VISIBLE }
@@ -997,7 +1145,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
         main.postDelayed(controlBarHideRunnable, CONTROL_BAR_TIMEOUT_MS)
     }
 
-    /** Route the cursor click: keyboard first, then the focused menu button, else
+    /** Route the cursor click: keyboard first, then focus-driven surfaces, else
      *  let it flow to native UI at the cursor position. */
     private fun handleClick(x: Float, y: Float): Boolean {
         val kb = keyboardView
@@ -1011,13 +1159,40 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             ctlButtons.getOrNull(ctlFocus)?.performClick()
             return true
         }
+        // The library is entirely focus-driven (no cursor): a tap activates
+        // whatever is highlighted — book, submenu option, or confirm button.
+        if (screen == Screen.LIBRARY) {
+            when {
+                confirmOverlay.visibility == View.VISIBLE ->
+                    (if (confirmFocus == 1) confirmYes else confirmNo).performClick()
+                bookMenuOverlay.visibility == View.VISIBLE ->
+                    bookMenuItems.getOrNull(bookMenuFocus)?.performClick()
+                else -> libItems.getOrNull(libFocus)?.performClick()
+            }
+            return true
+        }
         return false // dispatched to viewport -> native onClick
     }
 
+    // Scrubbing during narration: pause the voice, follow the thumb, then resume
+    // narration from wherever the scrub landed once it settles. (Scrub used to be
+    // silently disabled whenever TTS was on — which read as "scroll is broken".)
+    private val scrubTtsRestart = Runnable {
+        val b = book ?: return@Runnable
+        if (ttsOn) tts.start(b, reader.focusIndex)
+    }
+
     private fun handleScroll(dy: Int) {
+        android.util.Log.d("TapReaderInput", "scrub dy=$dy screen=$screen ttsOn=$ttsOn")
         when (screen) {
-            // Don't let manual scrubbing fight the narration highlight.
-            Screen.READER -> if (!ttsOn) reader.seekWords(if (dy > 0) 2 else -2)
+            Screen.READER -> {
+                if (ttsOn) {
+                    tts.pause()
+                    main.removeCallbacks(scrubTtsRestart)
+                    main.postDelayed(scrubTtsRestart, 700L)
+                }
+                reader.seekWords(if (dy > 0) 2 else -2)
+            }
             else -> activeScroll()?.scrollBy(0, dy * 2)
         }
     }
@@ -1032,6 +1207,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
     private fun onBack() {
         when {
             confirmOverlay.visibility == View.VISIBLE -> hideConfirm()
+            bookMenuOverlay.visibility == View.VISIBLE -> hideBookMenu()
             keyboardContainer.visibility == View.VISIBLE -> hideKeyboard()
             screen == Screen.READER -> closeBook()
             screen == Screen.GET_BOOKS || screen == Screen.SETTINGS -> showLibrary()
@@ -1042,8 +1218,14 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
     private fun onDoubleTap() {
         when (screen) {
             Screen.READER -> if (controlBar.visibility == View.VISIBLE) hideControlBar() else showControlBar()
-            // From the library, double-tap jumps back into the open book.
-            Screen.LIBRARY -> if (book != null) showReader()
+            Screen.LIBRARY -> when {
+                // Double-tap backs out of the book submenu / confirm first.
+                confirmOverlay.visibility == View.VISIBLE -> hideConfirm()
+                bookMenuOverlay.visibility == View.VISIBLE -> hideBookMenu()
+                // Otherwise it jumps back into the open book.
+                book != null -> showReader()
+                else -> {}
+            }
             else -> showLibrary()
         }
     }

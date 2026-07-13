@@ -173,6 +173,45 @@ class TtsReader(private val context: Context) {
         }.start()
     }
 
+    /**
+     * Speak a short UI cue ("Starting narration") with minimum latency: the
+     * synthesized clip is cached per voice, so after the first use it plays
+     * instantly. Skipped silently if book narration audio has already begun —
+     * by then the cue's moment has passed and it would talk over the text.
+     */
+    fun speakCue(text: String) {
+        if (key.isBlank()) return
+        val dir = File(context.filesDir, "cues").apply { mkdirs() }
+        val cache = File(dir, "${voiceId.ifBlank { DEFAULT_VOICE }}_${text.hashCode().toUInt().toString(16)}.mp3")
+        Thread {
+            val clip: File? = if (cache.isFile && cache.length() > 0) cache else {
+                synth(sanitizeForSpeech(text))?.let { tmp ->
+                    runCatching { tmp.copyTo(cache, overwrite = true) }
+                    tmp.delete()
+                    cache.takeIf { it.isFile && it.length() > 0 }
+                }
+            }
+            if (clip == null) return@Thread
+            main.post {
+                if (player?.isPlaying == true) return@post   // narration already speaking
+                stopOneOff()
+                runCatching {
+                    val mp = MediaPlayer()
+                    oneOff = mp
+                    mp.setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
+                    )
+                    mp.setDataSource(clip.absolutePath)
+                    mp.setOnCompletionListener { runCatching { mp.release() }; if (oneOff === mp) oneOff = null }
+                    mp.setOnErrorListener { _, _, _ -> runCatching { mp.release() }; if (oneOff === mp) oneOff = null; true }
+                    mp.prepare(); mp.start()
+                }
+            }
+        }.start()
+    }
+
     val isSpeakingOnce: Boolean get() = oneOff?.isPlaying == true
 
     fun stopOneOff() {
@@ -180,6 +219,7 @@ class TtsReader(private val context: Context) {
     }
 
     private fun stopInternal() {
+        session++          // invalidate every in-flight synthesis/playback callback
         active = false
         paused = false
         stopOneOff()
@@ -192,6 +232,13 @@ class TtsReader(private val context: Context) {
     }
 
     // ---- Sentence pipeline -------------------------------------------------
+
+    // Restart token: bumped on every stop/start. In-flight synthesis threads from
+    // a superseded run carry the old value, so their audio is discarded instead of
+    // playing on top of the new run ("two narrators at once" was exactly this: a
+    // quick pause-scrub-resume sequence let a stale sentence land after a restart
+    // had already flipped `active` back on).
+    private var session = 0
 
     private fun speakCurrent() {
         if (!active) return
@@ -210,14 +257,15 @@ class TtsReader(private val context: Context) {
 
         val cached = prefetch?.takeIf { it.first == sentenceAt }?.second
         prefetch = null
-        if (cached != null) { playFile(cached, s) ; prefetchNext(); return }
+        if (cached != null) { playFile(cached, s, session) ; prefetchNext(); return }
 
+        val mySession = session
         Thread {
             val file = synth(s.text)
             main.post {
-                if (!active) { file?.delete(); return@post }
+                if (!active || mySession != session) { file?.delete(); return@post }
                 if (file == null) { /* error already surfaced */ stop(); return@post }
-                playFile(file, s)
+                playFile(file, s, mySession)
                 prefetchNext()
             }
         }.start()
@@ -228,13 +276,17 @@ class TtsReader(private val context: Context) {
         if (next >= sentences.size) return
         val s = sentences[next]
         if (s.text.isBlank()) return   // skipped silently by speakCurrent
+        val mySession = session
         Thread {
             val f = synth(s.text)
-            main.post { if (active && f != null) prefetch = next to f else f?.delete() }
+            main.post {
+                if (active && mySession == session && f != null) prefetch = next to f else f?.delete()
+            }
         }.start()
     }
 
-    private fun playFile(file: File, s: Sentence) {
+    private fun playFile(file: File, s: Sentence, mySession: Int) {
+        if (!active || mySession != session) { file.delete(); return }
         runCatching {
             val mp = MediaPlayer()
             player = mp
@@ -247,9 +299,9 @@ class TtsReader(private val context: Context) {
             mp.setOnCompletionListener {
                 runCatching { mp.release() }; if (player === mp) player = null
                 file.delete()
-                if (active) { onWord?.invoke((s.startWord + s.words.size).coerceAtMost((book?.wordCount ?: 1) - 1)); sentenceAt++; speakCurrent() }
+                if (active && mySession == session) { onWord?.invoke((s.startWord + s.words.size).coerceAtMost((book?.wordCount ?: 1) - 1)); sentenceAt++; speakCurrent() }
             }
-            mp.setOnErrorListener { _, w, e -> Log.w(TAG, "tts play err $w/$e"); file.delete(); if (active) { sentenceAt++; speakCurrent() }; true }
+            mp.setOnErrorListener { _, w, e -> Log.w(TAG, "tts play err $w/$e"); file.delete(); if (active && mySession == session) { sentenceAt++; speakCurrent() }; true }
             mp.prepare()
             mp.start()
             startPolling(s, mp.duration)
