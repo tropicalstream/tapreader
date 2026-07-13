@@ -64,6 +64,8 @@ class BinocularSbsLayout @JvmOverloads constructor(
     var menuNavigationActive: (() -> Boolean)? = null
     /** Menu focus steps while [menuNavigationActive]: -1 = left, +1 = right. */
     var horizontalStepHandler: ((Int) -> Unit)? = null
+    /** Deliberate swipe UP while the menu is active — conventional "dismiss". */
+    var menuDismissHandler: (() -> Unit)? = null
 
     private var cursorX = 320f
     private var cursorY = 240f
@@ -92,6 +94,7 @@ class BinocularSbsLayout @JvmOverloads constructor(
     private var edgeScrollActive = false
     private var menuStepAccum = 0f
     private var lastMenuStepMs = 0L
+    private var menuDismissAccum = 0f
     // Edge PULL gestures: with the cursor pinned at an edge, continued push in
     // that direction accumulates until it crosses the threshold (parking or
     // passing never triggers). The *Fired latches after one fire so a single
@@ -137,7 +140,16 @@ class BinocularSbsLayout @JvmOverloads constructor(
     // tap, or temple click brings it straight back.
     private val cursorHideRunnable = Runnable { cursorView.visibility = View.INVISIBLE }
 
+    /** While this returns true the crosshair never shows — used by fully
+     *  focus-driven screens (the library) where swipes move a highlight instead. */
+    var cursorSuppressed: (() -> Boolean)? = null
+
     private fun pokeCursor() {
+        if (cursorSuppressed?.invoke() == true) {
+            cursorView.visibility = View.INVISIBLE
+            removeCallbacks(cursorHideRunnable)
+            return
+        }
         cursorView.visibility = View.VISIBLE
         removeCallbacks(cursorHideRunnable)
         postDelayed(cursorHideRunnable, CURSOR_HIDE_MS)
@@ -234,6 +246,7 @@ class BinocularSbsLayout @JvmOverloads constructor(
                 leftPullAccum = 0f; leftPullFired = false
                 rightPullAccum = 0f; rightPullFired = false
                 menuStepAccum = 0f
+                menuDismissAccum = 0f
                 if (activeSide == Side.LEFT_VOLUME) {
                     leftVolumeStartY = rawY
                     leftVolumeStart = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
@@ -263,7 +276,15 @@ class BinocularSbsLayout @JvmOverloads constructor(
                     // De-twitch: only clearly horizontal motion counts (finger
                     // wobble is mostly diagonal), and reversing direction restarts
                     // the count instead of banking credit both ways.
-                    if (abs(dx) > abs(dy) * 1.2f) {
+                    if (abs(dy) > abs(dx) * 1.2f) {
+                        // Deliberate upward swipe dismisses the menu; downward
+                        // movement drains the accumulator instead of banking it.
+                        menuDismissAccum = (menuDismissAccum - dy).coerceAtLeast(0f)
+                        if (menuDismissAccum >= MENU_DISMISS_PX) {
+                            menuDismissAccum = 0f
+                            menuDismissHandler?.invoke()
+                        }
+                    } else if (abs(dx) > abs(dy) * 1.2f) {
                         if (menuStepAccum != 0f && (menuStepAccum > 0f) != (dx > 0f)) menuStepAccum = 0f
                         menuStepAccum += dx
                         if (abs(menuStepAccum) >= MENU_STEP_PX) {
@@ -457,6 +478,7 @@ class BinocularSbsLayout @JvmOverloads constructor(
         if (edgeScrollDy == 0) { stopEdgeScroll(); return }
         if (!edgeScrollActive) {
             edgeScrollActive = true
+            android.util.Log.d("TapReaderInput", "edge scroll engaged dy=$edgeScrollDy cursorY=$cursorY")
             removeCallbacks(edgeScrollRunnable)
             post(edgeScrollRunnable)
         }
@@ -514,6 +536,8 @@ class BinocularSbsLayout @JvmOverloads constructor(
         // Minimum pause between focus steps — even a hard flick moves one button,
         // then the pad must travel a fresh MENU_STEP_PX after this beat.
         private const val MENU_STEP_COOLDOWN_MS = 220L
+        // Upward pad travel that dismisses the menu bar (swipe-up-to-close).
+        private const val MENU_DISMISS_PX = 90f
         // Hide the crosshair after this long with no pad/temple activity.
         private const val CURSOR_HIDE_MS = 5_000L
     }

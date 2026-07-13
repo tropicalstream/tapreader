@@ -46,7 +46,17 @@ class ReaderView(context: Context) : View(context) {
 
     private var book: Book? = null
     var mode = MODE_PAGED
-        set(value) { field = value; relayout(); scrollY = targetScrollForFocus(); invalidate() }
+        set(value) {
+            if (field == value) return
+            field = value
+            // Entering a reading mode never auto-runs: the pacer waits for an
+            // explicit tap. (It used to keep playing across the switch, which both
+            // surprised the reader and silently swallowed edge-scrub gestures.)
+            if (!ttsDriven) pause()
+            relayout()
+            scrollY = targetScrollForFocus(); targetScrollY = scrollY
+            invalidate()
+        }
     var isPlaying = false
         private set
     /** When true, [focusIndex] is set externally by TTS; the pacer stays off. */
@@ -157,9 +167,14 @@ class ReaderView(context: Context) : View(context) {
         relayout(); scrollY = targetScrollForFocus(); targetScrollY = scrollY
     }
 
+    // True when [lines]/[wordToLine] don't match the current book/size — happens
+    // when a book is opened while in RSVP mode (layout is skipped for speed) and
+    // must be rebuilt the moment a text-layout mode is entered.
+    private var layoutDirty = false
+
     private fun relayout() {
-        val b = book ?: run { lines = emptyList(); return }
-        if (width == 0 || mode == MODE_RSVP) { return }
+        val b = book ?: run { lines = emptyList(); layoutDirty = false; return }
+        if (width == 0 || mode == MODE_RSVP) { layoutDirty = true; return }
         val fm = textPaint.fontMetrics
         lineHeight = (fm.descent - fm.ascent) * 1.42f
         paraGap = lineHeight * 0.55f
@@ -185,6 +200,7 @@ class ReaderView(context: Context) : View(context) {
         }
         lines = out
         wordToLine = w2l
+        layoutDirty = false
     }
 
     private fun linesPerPage(): Int {
