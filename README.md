@@ -1,8 +1,8 @@
 # TapReader
 
-**A professional document & ebook reader with text-to-speech, built for AR smart glasses** (RayNeo X3 Pro), with a **local web companion** for managing your library from any phone or computer on the same Wi-Fi.
+**A document & ebook reader with text-to-speech, built for AR smart glasses** (RayNeo X3 Pro), with a **local web companion** for managing your library from any phone or computer on the same Wi-Fi.
 
-No cloud, no account, no telemetry. Your books and API keys live on the glasses; the companion is just a browser window into them.
+No cloud (except fish tts and optional gemini), no account, no telemetry. Your books and API keys live on the glasses; the companion is just a browser window into them.
 
 ---
 
@@ -13,7 +13,7 @@ No cloud, no account, no telemetry. Your books and API keys live on the glasses;
 **Three reading modes** (switch any time — your place is kept):
 - **Page** — a clean page of text; the word being read is highlighted and the page turns itself.
 - **Auto-scroll** — text glides upward at your pace, highlight following along.
-- **One word at a time (RSVP)** — a single word centered with the optimal-recognition-point letter tinted, for fast focused reading. Adjustable words-per-minute.
+- **One word at a time** — a single word centered with the optimal-recognition-point letter tinted, for fast focused reading. Adjustable words-per-minute.
 
 **Text-to-speech (fish.audio)** with **word-accurate highlighting** — the spoken word lights up in lockstep with narration. Text is sanitized to characters fish.audio can voice cleanly (stray punctuation used to send some books into a loop of garbled audio); overly-fragmented paragraphs from poorly-formatted files are coalesced so narration doesn't stutter mid-sentence.
 
