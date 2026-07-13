@@ -43,6 +43,8 @@ class TtsReader(private val context: Context) {
         // fish.audio model header. Valid: s1 / s2-pro / s2.1-pro / s2.1-pro-free
         // (free-tier default). speech-1.5 was retired.
         const val MODEL = "s2.1-pro-free"
+        // Auto-found stand-in voice (persisted so the next session skips the search).
+        private const val K_VOICE_SUB = "fish_voice_substitute"
 
         /**
          * fish.audio chokes on typography it cannot voice — a stray ')' can send
@@ -86,6 +88,8 @@ class TtsReader(private val context: Context) {
 
     var onWord: ((globalWordIndex: Int) -> Unit)? = null
     var onError: ((String) -> Unit)? = null
+    /** Non-error information the reader should see (e.g. voice substitution). */
+    var onNotice: ((String) -> Unit)? = null
     var onStopped: (() -> Unit)? = null
 
     private val http = OkHttpClient.Builder()
@@ -110,7 +114,16 @@ class TtsReader(private val context: Context) {
     val isActive: Boolean get() = active
     val isPaused: Boolean get() = active && paused
 
-    fun configure(key: String, voiceId: String) { this.key = key.trim(); this.voiceId = voiceId.trim() }
+    fun configure(key: String, voiceId: String) {
+        this.key = key.trim()
+        // A newly chosen voice always gets tried again, even if a substitute is
+        // active — fixing the ID in Settings must win back immediately.
+        if (voiceId.trim() != this.voiceId) {
+            substituteVoice = ""
+            substituteAnnounced = false
+        }
+        this.voiceId = voiceId.trim()
+    }
 
     fun start(b: Book, fromWord: Int) {
         if (key.isBlank()) { onError?.invoke("Add your fish.audio API key in Settings"); return }
@@ -346,7 +359,46 @@ class TtsReader(private val context: Context) {
 
     // ---- fish.audio synthesis ---------------------------------------------
 
+    // ---- Voice fallback: when the configured voice stops resolving, find a
+    // ---- professional-sounding stand-in and tell the reader once. ------------
+
+    private var substituteVoice = ""
+    private var substituteAnnounced = false
+
+    private class FishResult(val file: File?, val voiceProblem: Boolean, val errorMsg: String?)
+
     private fun synth(text: String): File? {
+        val primary = voiceId.ifBlank { DEFAULT_VOICE }
+        val active = substituteVoice.ifBlank { primary }
+        val first = fishCall(text, active)
+        if (first.file != null) return first.file
+
+        if (first.voiceProblem) {
+            if (substituteVoice.isNotBlank()) {
+                // The stand-in itself died — clear it so the next attempt re-searches.
+                substituteVoice = ""
+                prefs().edit().remove(K_VOICE_SUB).apply()
+            } else {
+                val sub = (prefs().getString(K_VOICE_SUB, "") ?: "").ifBlank {
+                    searchProfessionalVoice().orEmpty()
+                }
+                if (sub.isNotBlank() && sub != active) {
+                    substituteVoice = sub
+                    prefs().edit().putString(K_VOICE_SUB, sub).apply()
+                    if (!substituteAnnounced) {
+                        substituteAnnounced = true
+                        main.post { onNotice?.invoke("Narrator voice unavailable — using a professional stand-in") }
+                    }
+                    val retry = fishCall(text, sub)
+                    if (retry.file != null) return retry.file
+                }
+            }
+        }
+        main.post { onError?.invoke(first.errorMsg ?: "TTS request failed") }
+        return null
+    }
+
+    private fun fishCall(text: String, voice: String): FishResult {
         return try {
             val payload = JSONObject()
                 .put("text", text)
@@ -354,8 +406,7 @@ class TtsReader(private val context: Context) {
                 .put("mp3_bitrate", 128)
                 .put("normalize", true)
                 .put("latency", "normal")
-                // A voice is required; fall back to the default narrator.
-                .put("reference_id", voiceId.ifBlank { DEFAULT_VOICE })
+                .put("reference_id", voice)
             val req = Request.Builder()
                 .url(BASE)
                 .header("Authorization", "Bearer $key")
@@ -371,20 +422,40 @@ class TtsReader(private val context: Context) {
                         429 -> "fish.audio rate limit — slowing down"
                         else -> "TTS error ${resp.code}: ${body.take(100)}"
                     }
-                    main.post { onError?.invoke(msg) }
-                    return null
+                    // Account/limit codes are not the voice's fault; anything else
+                    // on a TTS call is overwhelmingly a dead reference_id.
+                    val voiceProblem = resp.code !in setOf(401, 402, 403, 429)
+                    Log.w(TAG, "fish $voice failed: HTTP ${resp.code}")
+                    return FishResult(null, voiceProblem, msg)
                 }
                 val f = File.createTempFile("tts_", ".mp3", context.cacheDir)
                 f.outputStream().use { out -> resp.body?.byteStream()?.copyTo(out) }
-                f
+                FishResult(f, false, null)
             }
         } catch (e: Exception) {
             Log.w(TAG, "synth failed: ${e.message}")
             val net = e is java.net.UnknownHostException || (e.message?.contains("host") == true)
-            main.post { onError?.invoke(if (net) "No internet connection" else "TTS request failed") }
-            null
+            FishResult(null, false, if (net) "No internet connection" else "TTS request failed")
         }
     }
+
+    /** Most-used library voice matching "professional" — the stand-in criteria. */
+    private fun searchProfessionalVoice(): String? {
+        val req = Request.Builder()
+            .url("https://api.fish.audio/model?page_size=8&sort_by=task_count&title=professional")
+            .header("Authorization", "Bearer $key").get().build()
+        return runCatching {
+            http.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                val items = JSONObject(resp.body?.string().orEmpty()).optJSONArray("items") ?: return null
+                (0 until items.length()).firstNotNullOfOrNull { i ->
+                    items.optJSONObject(i)?.optString("_id")?.takeIf { it.isNotBlank() }
+                }
+            }
+        }.onFailure { Log.w(TAG, "voice search failed: ${it.message}") }.getOrNull()
+    }
+
+    private fun prefs() = context.getSharedPreferences("tapreader", android.content.Context.MODE_PRIVATE)
 
     // ---- Build sentences from the word stream ------------------------------
 

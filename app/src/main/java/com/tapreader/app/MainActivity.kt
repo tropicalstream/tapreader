@@ -760,6 +760,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
     private fun wireTts() {
         tts.onWord = { idx -> reader.setFocus(idx) }
         tts.onError = { msg -> main.post { flash(msg) } }
+        tts.onNotice = { msg -> main.post { flash(msg) } }
         // TTS stopped itself (finished/errored): return control to the tap-pacer.
         tts.onStopped = { main.post { ttsOn = false; reader.ttsDriven = false; saveProgress(); rebuildControlBar() } }
     }
