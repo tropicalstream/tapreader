@@ -207,6 +207,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
         buildConfirmOverlay()
         buildTocOverlay()
         buildBookMenuOverlay()
+        buildBookDetailOverlay()
 
         viewport = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -222,6 +223,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             addView(keyboardContainer)
             addView(tocOverlay, match())
             addView(bookMenuOverlay, match())
+            addView(bookDetailOverlay, match())
             addView(confirmOverlay, match())   // topmost — mirrors to both eyes
         }
 
@@ -405,34 +407,124 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
         applyBookMenuFocus()
     }
 
-    // ---- Library focus (no cursor on this screen) -----------------------------
+    // ---- 4-way hover selection (library + get-books are cursor-free) ----------
+    //
+    // Every gallery screen registers its actionable views in visual order. An
+    // amber ring marks the hovered item; horizontal swipes step ±1, vertical
+    // swipes move by GEOMETRY to the nearest item in the next row (same column
+    // preferred, d-pad style). Tap activates whatever is ringed.
 
-    private val libItems = mutableListOf<View>()
-    private var libFocus = 0
+    private val hoverItems = mutableListOf<View>()
+    private var hoverFocus = 0
 
-    private fun registerLibItem(v: View) { libItems += v }
-
-    private fun applyLibFocus() {
-        libFocus = libFocus.coerceIn(0, (libItems.size - 1).coerceAtLeast(0))
-        libItems.forEachIndexed { i, v ->
-            v.foreground = if (i == libFocus) android.graphics.drawable.GradientDrawable().apply {
-                cornerRadius = dp(9).toFloat()
-                setColor(0x22FFC466)
-                setStroke(dp(2), 0xFFFFC466.toInt())
-            } else null
-        }
-        // Keep the focused item on screen (edge-scroll is retired here).
-        libItems.getOrNull(libFocus)?.let { v ->
-            var y = 0; var cur: View = v
-            while (cur !== libraryList && cur.parent is View) { y += cur.top; cur = cur.parent as View }
-            libraryPanel.smoothScrollTo(0, (y - dp(70)).coerceAtLeast(0))
-        }
+    private fun hoverReset() {
+        hoverItems.clear()
+        hoverFocus = 0
     }
 
-    private fun stepLibFocus(delta: Int) {
-        if (libItems.isEmpty()) return
-        libFocus = (libFocus + delta).mod(libItems.size)
-        applyLibFocus()
+    /** Register every actionable view under [root] in visual (tree) order. A
+     *  clickable container with clickable children defers to the children. */
+    private fun hoverRegisterTree(root: View) {
+        if (root.visibility != View.VISIBLE) return
+        if (root is ViewGroup) {
+            if (root.isClickable && !hasClickableDescendant(root)) { hoverItems += root; return }
+            for (i in 0 until root.childCount) hoverRegisterTree(root.getChildAt(i))
+        } else if (root.isClickable) hoverItems += root
+    }
+
+    private fun hasClickableDescendant(g: ViewGroup): Boolean {
+        for (i in 0 until g.childCount) {
+            val c = g.getChildAt(i)
+            if (c.visibility != View.VISIBLE) continue
+            if (c.isClickable) return true
+            if (c is ViewGroup && hasClickableDescendant(c)) return true
+        }
+        return false
+    }
+
+    /** Rebuild the hover registry for the visible gallery screen. Focus is
+     *  PRESERVED — refreshes mid-navigation must not snap the ring to the top;
+     *  screen entry points call [hoverReset] explicitly for a fresh start. */
+    private fun rebuildHover(root: View) {
+        val keep = hoverFocus
+        hoverItems.clear()
+        hoverRegisterTree(root)
+        hoverFocus = keep.coerceIn(0, (hoverItems.size - 1).coerceAtLeast(0))
+        applyHoverFocus(scrollTo = false)
+    }
+
+    /** Center of a hover item in its screen's scroll-content coordinate space. */
+    private fun hoverCenter(v: View): Pair<Float, Float> {
+        var x = 0; var y = 0; var cur: View = v
+        val content = activeScroll()?.getChildAt(0)
+        while (cur !== content && cur.parent is View) {
+            x += cur.left; y += cur.top
+            cur = cur.parent as View
+        }
+        return (x + v.width / 2f) to (y + v.height / 2f)
+    }
+
+    private fun stepHover(delta: Int) {
+        if (hoverItems.isEmpty()) return
+        // Clamped at both ends — wrap-around teleports read as random jumps.
+        hoverFocus = (hoverFocus + delta).coerceIn(0, hoverItems.lastIndex)
+        applyHoverFocus()
+    }
+
+    /** Vertical navigation by geometry: nearest item in the next row down/up,
+     *  preferring the same column — index arithmetic moves sideways whenever
+     *  mixed-size items interleave with grid rows. */
+    private fun stepHoverVertical(dir: Int) {
+        val cur = hoverItems.getOrNull(hoverFocus) ?: return
+        val (cx, cy) = hoverCenter(cur)
+        // Same-row neighbors can differ in height (wrapped titles), putting
+        // their centers a few px "below" — a real next-row candidate must
+        // clear half the current item's height.
+        val rowClear = cur.height * 0.45f
+        var best = -1
+        var bestKey = Float.MAX_VALUE
+        hoverItems.forEachIndexed { i, v ->
+            if (i == hoverFocus) return@forEachIndexed
+            val (x, y) = hoverCenter(v)
+            if (dir > 0 && y <= cy + rowClear) return@forEachIndexed
+            if (dir < 0 && y >= cy - rowClear) return@forEachIndexed
+            val key = kotlin.math.abs(y - cy) * 1000f + kotlin.math.abs(x - cx)
+            if (key < bestKey) { bestKey = key; best = i }
+        }
+        if (best >= 0) { hoverFocus = best; applyHoverFocus() }
+        // No candidate = top/bottom edge: stay put, never wrap-teleport.
+    }
+
+    private fun activateHover() { hoverItems.getOrNull(hoverFocus)?.performClick() }
+
+    private fun hoverLabel(v: View): String =
+        v.contentDescription?.toString()?.take(30)
+            ?: (v as? Button)?.text?.toString()?.take(30)
+            ?: v.javaClass.simpleName
+
+    /** The amber selection ring drawn over the hovered view. */
+    private fun hoverRing() = android.graphics.drawable.GradientDrawable().apply {
+        cornerRadius = dp(9).toFloat()
+        setColor(0x22FFC466)
+        setStroke(dp(2), 0xFFFFC466.toInt())
+    }
+
+    private fun applyHoverFocus(scrollTo: Boolean = true) {
+        if (hoverItems.isEmpty()) return
+        hoverFocus = hoverFocus.coerceIn(0, hoverItems.lastIndex)
+        hoverItems.forEachIndexed { i, v ->
+            v.foreground = if (i == hoverFocus) hoverRing() else null
+        }
+        android.util.Log.i("TapReaderInput", "hover $hoverFocus/${hoverItems.size} on ${hoverLabel(hoverItems[hoverFocus])}")
+        if (!scrollTo) return
+        // Keep the ringed item comfortably on screen.
+        val panel = activeScroll() ?: return
+        val content = panel.getChildAt(0) ?: return
+        hoverItems.getOrNull(hoverFocus)?.let { v ->
+            var y = 0; var cur: View = v
+            while (cur !== content && cur.parent is View) { y += cur.top; cur = cur.parent as View }
+            panel.smoothScrollTo(0, (y - dp(80)).coerceAtLeast(0))
+        }
     }
 
     // ---- Table-of-contents overlay (mirrored to both eyes) ------------------
@@ -566,7 +658,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
     private fun showLibrary() {
         screen = Screen.LIBRARY; showOnly(libraryPanel); controlBar.visibility = View.GONE
         hideKeyboard(); hideBookMenu()
-        libFocus = 0
+        hoverReset()
         refreshLibrary(); refreshHud()
     }
     private fun showReader() { screen = Screen.READER; showOnly(reader); reader.bringToFront(); controlBar.bringToFront(); topHud.bringToFront(); statusPill.bringToFront(); refreshHud() }
@@ -577,7 +669,6 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
 
     private fun refreshLibrary() {
         libraryList.removeAllViews()
-        libItems.clear()
         val s = library.streak()
         banner.text = encouragement(s)
         libraryList.addView(banner)
@@ -590,10 +681,10 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             libraryList.addView(bookGallery(shelf))
         }
         libraryList.addView(spacer())
-        libraryList.addView(bigButton("🔍  Get free books") { openGetBooks() }.also { registerLibItem(it) })
-        libraryList.addView(bigButton("⚙  Settings") { showSettings() }.also { registerLibItem(it) })
+        libraryList.addView(bigButton("🔍  Get free books") { openGetBooks() })
+        libraryList.addView(bigButton("⚙  Settings") { showSettings() })
         libraryList.addView(hint(deviceInfoLine()))
-        applyLibFocus()
+        rebuildHover(libraryList)
     }
 
     private fun bookGallery(items: List<Shelf>): View {
@@ -625,8 +716,8 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             }
             // Tap on the focused book opens its action submenu (Open/Reset/Remove).
             setOnClickListener { showBookMenu(item) }
+            contentDescription = item.title
         }
-        registerLibItem(tile)
         val holder = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(178))
             background = android.graphics.drawable.GradientDrawable().apply {
@@ -823,31 +914,223 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
         }
     }
 
-    // ---- Get free books ----------------------------------------------------
+    // ---- Get free books (modern gallery: library cards → cover grid → detail) ----
 
     private fun openGetBooks() {
+        hoverReset()
         showGetBooks()
         renderGetBooks(emptyList(), null)
     }
 
     private var getBooksSource = "gutenberg"
+    private val thumbExecutor = java.util.concurrent.Executors.newFixedThreadPool(3)
 
-    private fun renderGetBooks(results: List<BookSource.Result>, query: String?) {
+    private fun renderGetBooks(results: List<BookSource.Result>, query: String?, focusResults: Boolean = false) {
         getBooksList.removeAllViews()
-        getBooksList.addView(sectionTitle("🔍  Get free books"))
-        getBooksList.addView(hint("Tap a catalog to browse, then tap a book to download it into your library."))
-        getBooksList.addView(bigButton("📖  Project Gutenberg — popular") { browseSource("gutenberg") })
-        getBooksList.addView(bigButton("✒  Standard Ebooks — newest") { browseSource("standardebooks") })
+        getBooksList.addView(sectionTitle("📚  Get free books"))
+
+        // The two in-app catalogs as graphical library cards.
+        getBooksList.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(libraryCard("📖", "Project Gutenberg", "75,000+ free classics",
+                "Browse popular ›", 0xFF1D3A2E.toInt()) { browseSource("gutenberg") })
+            addView(libraryCard("✒", "Standard Ebooks", "Beautifully typeset editions",
+                "Browse newest ›", 0xFF23324A.toInt()) { browseSource("standardebooks") })
+        })
+        getBooksList.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(searchChip("🔍  Search Gutenberg") { promptSearch("gutenberg") })
+            addView(searchChip("🔍  Search Standard Ebooks") { promptSearch("standardebooks") })
+        })
+
+        var firstTile: View? = null
         if (results.isNotEmpty()) {
             val src = if (getBooksSource == "standardebooks") "Standard Ebooks" else "Project Gutenberg"
-            getBooksList.addView(sectionTitle("$src · ${query.orEmpty()}"))
-            getBooksList.addView(bigButton("🔍  Search $src by title or author") { promptSearch(getBooksSource) })
-            for (r in results) getBooksList.addView(resultRow(r))
+            getBooksList.addView(sectionTitle("$src — ${query.orEmpty()} · ${results.size} books"))
+            // Cover-thumbnail grid, three per row, names underneath. Tapping a
+            // book opens its detail card (cover, summary, download).
+            var row: LinearLayout? = null
+            results.forEachIndexed { i, r ->
+                if (i % 3 == 0) {
+                    row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                    getBooksList.addView(row)
+                }
+                val tile = freeBookTile(r)
+                if (firstTile == null) firstTile = tile
+                row!!.addView(tile)
+            }
+            val rem = results.size % 3
+            if (rem != 0) repeat(3 - rem) {
+                row!!.addView(View(this).apply { layoutParams = LinearLayout.LayoutParams(0, 1, 1f) })
+            }
         }
+
         getBooksList.addView(sectionTitle("More free libraries"))
-        for (repo in BookSource.REPOSITORIES) getBooksList.addView(repoRow(repo))
+        var repoRow: LinearLayout? = null
+        BookSource.REPOSITORIES.forEachIndexed { i, repo ->
+            if (i % 2 == 0) {
+                repoRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                getBooksList.addView(repoRow)
+            }
+            repoRow!!.addView(repoCard(repo))
+        }
+        if (BookSource.REPOSITORIES.size % 2 != 0) {
+            repoRow!!.addView(View(this).apply { layoutParams = LinearLayout.LayoutParams(0, 1, 1f) })
+        }
         getBooksList.addView(spacer())
         getBooksList.addView(bigButton("‹ Back to library") { showLibrary() })
+        rebuildHover(getBooksList)
+        // After a browse/search lands, put the ring on the first book so the
+        // next swipe walks the results, not the header.
+        if (focusResults) firstTile?.let { t ->
+            val i = hoverItems.indexOf(t)
+            if (i >= 0) { hoverFocus = i; applyHoverFocus() }
+        }
+    }
+
+    /** Big graphical catalog card: glyph, name, tagline, action line. */
+    private fun libraryCard(glyph: String, name: String, tag: String, action: String,
+                            accent: Int, onClick: () -> Unit): View =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            isClickable = true
+            contentDescription = name
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = android.graphics.drawable.GradientDrawable(
+                android.graphics.drawable.GradientDrawable.Orientation.TL_BR,
+                intArrayOf(accent, 0xFF10151B.toInt())
+            ).apply { cornerRadius = dp(12).toFloat(); setStroke(dp(1), 0xFF30363D.toInt()) }
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { setMargins(dp(4), dp(4), dp(4), dp(2)) }
+            addView(TextView(this@MainActivity).apply { text = glyph; textSize = 28f })
+            addView(TextView(this@MainActivity).apply {
+                text = name; textSize = 15f; setTextColor(Color.WHITE)
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setPadding(0, dp(4), 0, 0)
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = tag; textSize = 11f; setTextColor(0xFF9AA6B2.toInt())
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = action; textSize = 12f; setTextColor(0xFF3FB950.toInt()); setPadding(0, dp(6), 0, 0)
+            })
+            setOnClickListener { onClick() }
+        }
+
+    private fun searchChip(label: String, onClick: () -> Unit): View =
+        Button(this).apply {
+            text = label; isAllCaps = false; textSize = 12f
+            stateListAnimator = null
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(14).toFloat()
+                setColor(0xFF1B2026.toInt()); setStroke(dp(1), 0xFF30363D.toInt())
+            }
+            setTextColor(0xFFB9C2CC.toInt())
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { setMargins(dp(4), dp(2), dp(4), dp(4)) }
+            setOnClickListener { onClick() }
+        }
+
+    /** Small book tile: cover thumbnail with the name underneath. */
+    private fun freeBookTile(r: BookSource.Result): View {
+        val holder = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(150))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(coverPlaceholderColor(r.title)); cornerRadius = dp(8).toFloat()
+            }
+            clipToOutline = true
+        }
+        val initials = TextView(this).apply {
+            text = r.title.take(2).uppercase(); textSize = 24f
+            setTextColor(0x88FFFFFF.toInt()); gravity = Gravity.CENTER
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+        val image = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+        holder.addView(initials); holder.addView(image)
+        loadThumb(r.coverUrl, image, initials)
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            isClickable = true
+            contentDescription = r.title
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { setMargins(dp(4), dp(4), dp(4), dp(6)) }
+            addView(holder)
+            addView(TextView(this@MainActivity).apply {
+                text = r.title; textSize = 12f; maxLines = 2
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setTextColor(0xFFFFE7B0.toInt()); setPadding(dp(2), dp(5), dp(2), 0)
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = r.author.ifBlank { " " }; textSize = 10f; maxLines = 1
+                setTextColor(0xFF8B949E.toInt()); setPadding(dp(2), dp(1), dp(2), 0)
+            })
+            setOnClickListener { showBookDetail(r) }
+        }
+    }
+
+    private fun loadThumb(url: String?, image: ImageView, initials: TextView) {
+        if (url.isNullOrBlank()) return
+        covers.cachedThumb(url)?.let {
+            image.setImageBitmap(it); initials.visibility = View.GONE; return
+        }
+        thumbExecutor.execute {
+            val bmp = covers.loadOrFetchThumb(url)
+            if (bmp != null) main.post {
+                image.setImageBitmap(bmp); initials.visibility = View.GONE
+            }
+        }
+    }
+
+    /** Compact card for the external libraries list. */
+    private fun repoCard(repo: BookSource.Repo): View {
+        val browsable = repo.url.contains("gutenberg.org") || repo.url.contains("standardebooks.org")
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = true
+            contentDescription = repo.name
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xFF12161B.toInt()); cornerRadius = dp(10).toFloat()
+                setStroke(dp(1), 0xFF262D34.toInt())
+            }
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { setMargins(dp(4), dp(3), dp(4), dp(3)) }
+            addView(TextView(this@MainActivity).apply {
+                text = repo.name.take(2).uppercase(); textSize = 14f
+                setTextColor(0xFFD6D2A0.toInt()); gravity = Gravity.CENTER
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    setColor(coverPlaceholderColor(repo.name)); cornerRadius = dp(8).toFloat()
+                }
+                layoutParams = LinearLayout.LayoutParams(dp(36), dp(36))
+            })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(8), 0, 0, 0)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addView(TextView(this@MainActivity).apply {
+                    text = repo.name; textSize = 13f; maxLines = 1
+                    setTextColor(if (browsable) 0xFF58A6FF.toInt() else Color.WHITE)
+                    setTypeface(typeface, android.graphics.Typeface.BOLD)
+                })
+                addView(TextView(this@MainActivity).apply {
+                    text = if (browsable) "Browse here ›" else repo.note
+                    textSize = 10f; maxLines = 2
+                    setTextColor(if (browsable) 0xFF3FB950.toInt() else 0xFF8B949E.toInt())
+                })
+            })
+            setOnClickListener {
+                when {
+                    repo.url.contains("gutenberg.org") -> browseSource("gutenberg")
+                    repo.url.contains("standardebooks.org") -> browseSource("standardebooks")
+                    // No web browser on the glasses; these need accounts/DRM anyway.
+                    else -> flash("${repo.name}: open on the phone companion or a computer — the glasses have no web browser.")
+                }
+            }
+        }
     }
 
     private fun browseSource(source: String) {
@@ -857,9 +1140,8 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
         Thread {
             val results = if (source == "standardebooks") BookSource.browseStandardEbooks() else BookSource.popularGutenberg()
             main.post {
-                renderGetBooks(results, if (source == "standardebooks") "newest" else "popular")
-                getBooksPanel.scrollTo(0, 0)
-                flash(if (results.isEmpty()) "Couldn't load $label — check Wi-Fi" else "${results.size} books · tap to download")
+                renderGetBooks(results, if (source == "standardebooks") "newest" else "popular", focusResults = true)
+                flash(if (results.isEmpty()) "Couldn't load $label — check Wi-Fi" else "${results.size} books · tap one for details")
             }
         }.start()
     }
@@ -878,61 +1160,172 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             val results = if (source == "standardebooks") BookSource.searchStandardEbooks(q)
             else BookSource.searchGutenberg(q)
             main.post {
-                renderGetBooks(results, q)
+                renderGetBooks(results, q, focusResults = true)
                 flash(if (results.isEmpty()) "No results" else "${results.size} results")
             }
         }.start()
     }
 
-    private fun resultRow(r: BookSource.Result): View {
-        val ll = card()
-        ll.addView(TextView(this).apply { text = r.title; textSize = 16f; setTextColor(0xFFFFE7B0.toInt()) })
-        ll.addView(TextView(this).apply {
-            text = (if (r.author.isNotBlank()) r.author + "  ·  " else "") + r.ext.uppercase()
-            textSize = 12f; setTextColor(0xFF8B949E.toInt())
+    // ---- Book detail overlay (cover · summary · download) -------------------
+
+    private lateinit var bookDetailOverlay: FrameLayout
+    private lateinit var bookDetailCard: LinearLayout
+    private val bookDetailButtons = mutableListOf<Button>()
+    private var bookDetailFocus = 0
+    // Vertical swipes scroll the summary while the card is open.
+    private var bookDetailScroll: ScrollView? = null
+
+    private fun buildBookDetailOverlay() {
+        bookDetailCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(14), dp(16), dp(12))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xFF161B22.toInt()); cornerRadius = dp(14).toFloat()
+                setStroke(dp(1), 0xFF30363D.toInt())
+            }
+            val lp = FrameLayout.LayoutParams(dp(390), FrameLayout.LayoutParams.WRAP_CONTENT)
+            lp.gravity = Gravity.CENTER; layoutParams = lp
+        }
+        bookDetailOverlay = FrameLayout(this).apply {
+            setBackgroundColor(0xCC000000.toInt())
+            isClickable = true
+            visibility = View.GONE
+            addView(bookDetailCard)
+        }
+    }
+
+    private fun showBookDetail(r: BookSource.Result) {
+        bookDetailCard.removeAllViews()
+        bookDetailButtons.clear()
+
+        val image = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+        val initials = TextView(this).apply {
+            text = r.title.take(2).uppercase(); textSize = 22f
+            setTextColor(0x88FFFFFF.toInt()); gravity = Gravity.CENTER
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+        loadThumb(r.coverUrl, image, initials)
+        bookDetailCard.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(FrameLayout(this@MainActivity).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(84), dp(122))
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    setColor(coverPlaceholderColor(r.title)); cornerRadius = dp(8).toFloat()
+                }
+                clipToOutline = true
+                addView(initials); addView(image)
+            })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(12), 0, 0, 0)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addView(TextView(this@MainActivity).apply {
+                    text = r.title; textSize = 16f; maxLines = 3; setTextColor(Color.WHITE)
+                    setTypeface(typeface, android.graphics.Typeface.BOLD)
+                })
+                addView(TextView(this@MainActivity).apply {
+                    text = r.author.ifBlank { "Unknown author" }; textSize = 12f
+                    setTextColor(0xFFFFE7B0.toInt()); setPadding(0, dp(3), 0, 0)
+                })
+                addView(TextView(this@MainActivity).apply {
+                    text = "${r.source} · ${r.ext.uppercase()}"; textSize = 11f
+                    setTextColor(0xFF58A6FF.toInt()); setPadding(0, dp(3), 0, 0)
+                })
+            })
         })
-        ll.setOnClickListener {
-            showConfirm("Download “${r.title.take(40)}”?", "Download") {
-                flash("Downloading ${r.title.take(30)}…", persist = true)
-                Thread {
-                    val bytes = BookSource.download(r.downloadUrl)
-                    main.post {
-                        if (bytes == null) { flash("Download failed"); return@post }
-                        val f = library.importFile(r.suggestedFileName(), bytes)
-                        library.saveBookMetadata(f.name, r.title, r.author, r.coverUrl)
-                        flash("✓ Added: ${r.title.take(30)}")
-                        requestOpenBook(f.name)
-                    }
-                }.start()
-            }
+
+        val summaryView = TextView(this).apply {
+            textSize = 12.5f; setTextColor(0xFFC6CFD8.toInt())
+            setLineSpacing(0f, 1.15f)
+            setPadding(0, 0, dp(6), dp(4))
         }
-        return ll
+        bookDetailScroll = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(150)).apply { setMargins(0, dp(10), 0, dp(8)) }
+            isVerticalScrollBarEnabled = true
+            isScrollbarFadingEnabled = false   // always show there's more to read
+            addView(summaryView)
+        }
+        bookDetailCard.addView(bookDetailScroll)
+        loadBookSummary(r, summaryView)
+
+        fun action(label: String, onPick: () -> Unit) {
+            val b = Button(this).apply {
+                text = label; isAllCaps = false; textSize = 14f
+                stateListAnimator = null
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    .apply { setMargins(dp(4), 0, dp(4), 0) }
+                setOnClickListener { onPick() }
+            }
+            bookDetailButtons += b
+        }
+        action("⬇  Download") { hideBookDetail(); downloadBook(r) }
+        action("✕  Close") { hideBookDetail() }
+        bookDetailCard.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            bookDetailButtons.forEach { addView(it) }
+        })
+        bookDetailCard.addView(TextView(this).apply {
+            text = "swipe ⇅ read summary · ⇄ buttons · tap chooses · double-tap closes"
+            textSize = 11f; setTextColor(0xFF6E7A85.toInt()); gravity = Gravity.CENTER
+            setPadding(0, dp(6), 0, 0)
+        })
+
+        bookDetailFocus = 0   // Download is why you opened the card
+        applyBookDetailFocus()
+        bookDetailOverlay.visibility = View.VISIBLE
+        bookDetailOverlay.bringToFront()
     }
 
-    private fun repoRow(repo: BookSource.Repo): View {
-        val ll = card()
-        ll.addView(TextView(this).apply { text = repo.name; textSize = 15f; setTextColor(0xFF58A6FF.toInt()) })
-        ll.addView(TextView(this).apply { text = repo.note; textSize = 12f; setTextColor(0xFF8B949E.toInt()) })
-        when {
-            repo.url.contains("gutenberg.org") -> {
-                ll.addView(actionHint("Tap to browse & download here ›"))
-                ll.setOnClickListener { browseSource("gutenberg") }
-            }
-            repo.url.contains("standardebooks.org") -> {
-                ll.addView(actionHint("Tap to browse & download here ›"))
-                ll.setOnClickListener { browseSource("standardebooks") }
-            }
-            else -> {
-                // No web browser on the glasses; these need accounts/DRM anyway.
-                ll.addView(TextView(this).apply { text = "Browse on the phone companion or a computer"; textSize = 11f; setTextColor(0xFF5A5E63.toInt()) })
-                ll.setOnClickListener { flash("${repo.name}: open on the phone companion or a computer — the glasses have no web browser.", persist = false) }
-            }
-        }
-        return ll
+    /** Summary chain, reputable public sources only: catalog blurb (Gutendex) →
+     *  publisher description (Standard Ebooks page) → Wikipedia/Open Library. */
+    private fun loadBookSummary(r: BookSource.Result, into: TextView) {
+        if (!r.summary.isNullOrBlank()) { into.text = r.summary; return }
+        into.text = "Loading summary…"
+        Thread {
+            val text = r.bookPageUrl?.let { BookSource.fetchStandardEbooksSummary(it) }
+                ?: BookInfoClient.summary(r.title, r.author).getOrNull()
+                    ?.let { "${it.text}\n\n— ${it.source}" }
+                ?: "No summary available for this edition."
+            main.post { if (bookDetailOverlay.visibility == View.VISIBLE) into.text = text }
+        }.start()
     }
 
-    private fun actionHint(t: String) = TextView(this).apply {
-        text = t; textSize = 12f; setTextColor(0xFF3FB950.toInt()); setPadding(0, dp(4), 0, 0)
+    private fun downloadBook(r: BookSource.Result) {
+        flash("Downloading ${r.title.take(30)}…", persist = true)
+        Thread {
+            val bytes = BookSource.download(r.downloadUrl)
+            main.post {
+                if (bytes == null) { flash("Download failed"); return@post }
+                val f = library.importFile(r.suggestedFileName(), bytes)
+                library.saveBookMetadata(f.name, r.title, r.author, r.coverUrl)
+                flash("✓ Added: ${r.title.take(30)}")
+                requestOpenBook(f.name)
+            }
+        }.start()
+    }
+
+    private fun hideBookDetail() { bookDetailOverlay.visibility = View.GONE }
+
+    private fun applyBookDetailFocus() {
+        bookDetailButtons.forEachIndexed { i, b ->
+            val focused = i == bookDetailFocus
+            b.background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(9).toFloat()
+                setColor(if (focused) 0xFF4B4829.toInt() else 0xFF1B2026.toInt())
+                setStroke(dp(if (focused) 2 else 1), if (focused) 0xFFFFC466.toInt() else 0xFF30363D.toInt())
+            }
+            b.setTextColor(if (focused) 0xFFFFF3C4.toInt() else 0xFFD8DEE9.toInt())
+        }
+    }
+
+    private fun stepBookDetailFocus(delta: Int) {
+        if (bookDetailButtons.isEmpty()) return
+        bookDetailFocus = (bookDetailFocus + delta).mod(bookDetailButtons.size)
+        applyBookDetailFocus()
     }
 
     // ---- Settings ----------------------------------------------------------
@@ -1104,19 +1497,41 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             doubleTapHandler = { onDoubleTap() }
             tripleTapHandler = { showSettings() }
             tapInterceptor = { false }
-            // Focus-driven surfaces: the reader's menu bar AND the whole library
-            // screen (which is cursor-free — swipes move the highlight instead).
-            menuNavigationActive = { menuNavActive() || screen == Screen.LIBRARY }
+            // Focus-driven surfaces: the reader's menu bar AND the gallery
+            // screens (library, get-books), which are cursor-free — 4-way
+            // swipes move the hover ring instead. The keyboard needs the
+            // cursor back (its keys are position-targeted).
+            menuNavigationActive = {
+                keyboardContainer.visibility != View.VISIBLE &&
+                    (menuNavActive() || screen == Screen.LIBRARY || screen == Screen.GET_BOOKS)
+            }
             horizontalStepHandler = { delta ->
                 when {
-                    screen == Screen.LIBRARY && confirmOverlay.visibility == View.VISIBLE -> stepConfirmFocus(delta)
-                    screen == Screen.LIBRARY && bookMenuOverlay.visibility == View.VISIBLE -> stepBookMenuFocus(delta)
-                    screen == Screen.LIBRARY -> stepLibFocus(delta)
+                    confirmOverlay.visibility == View.VISIBLE -> stepConfirmFocus(delta)
+                    bookMenuOverlay.visibility == View.VISIBLE -> stepBookMenuFocus(delta)
+                    bookDetailOverlay.visibility == View.VISIBLE -> stepBookDetailFocus(delta)
+                    screen == Screen.LIBRARY || screen == Screen.GET_BOOKS -> stepHover(delta)
                     else -> stepCtlFocus(delta)
                 }
             }
+            verticalStepHandler = { delta ->
+                when {
+                    confirmOverlay.visibility == View.VISIBLE -> stepConfirmFocus(delta)
+                    bookMenuOverlay.visibility == View.VISIBLE -> stepBookMenuFocus(delta)
+                    // On the detail card, vertical swipes READ: they scroll the
+                    // summary text. Horizontal swipes move between the buttons.
+                    bookDetailOverlay.visibility == View.VISIBLE ->
+                        bookDetailScroll?.smoothScrollBy(0, delta * dp(84))
+                    screen == Screen.LIBRARY || screen == Screen.GET_BOOKS -> stepHoverVertical(delta)
+                    // Reader menu keeps its convention: swipe up dismisses the bar.
+                    else -> if (delta < 0) hideControlBar()
+                }
+            }
             menuDismissHandler = { if (menuNavActive()) hideControlBar() }
-            cursorSuppressed = { screen == Screen.LIBRARY }
+            cursorSuppressed = {
+                (screen == Screen.LIBRARY || screen == Screen.GET_BOOKS) &&
+                    keyboardContainer.visibility != View.VISIBLE
+            }
             // Don't scrub the reading position while the menu bar or keyboard is up
             // (moving the cursor toward the bottom menu must not advance the word).
             contentInteractionBlocked = { controlBar.visibility == View.VISIBLE || keyboardContainer.visibility == View.VISIBLE }
@@ -1160,15 +1575,17 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             ctlButtons.getOrNull(ctlFocus)?.performClick()
             return true
         }
-        // The library is entirely focus-driven (no cursor): a tap activates
-        // whatever is highlighted — book, submenu option, or confirm button.
-        if (screen == Screen.LIBRARY) {
+        // Gallery screens are entirely hover-driven (no cursor): a tap activates
+        // whatever is ringed — book, overlay option, or confirm button.
+        if (screen == Screen.LIBRARY || screen == Screen.GET_BOOKS) {
             when {
                 confirmOverlay.visibility == View.VISIBLE ->
                     (if (confirmFocus == 1) confirmYes else confirmNo).performClick()
                 bookMenuOverlay.visibility == View.VISIBLE ->
                     bookMenuItems.getOrNull(bookMenuFocus)?.performClick()
-                else -> libItems.getOrNull(libFocus)?.performClick()
+                bookDetailOverlay.visibility == View.VISIBLE ->
+                    bookDetailButtons.getOrNull(bookDetailFocus)?.performClick()
+                else -> activateHover()
             }
             return true
         }
@@ -1209,6 +1626,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
         when {
             confirmOverlay.visibility == View.VISIBLE -> hideConfirm()
             bookMenuOverlay.visibility == View.VISIBLE -> hideBookMenu()
+            bookDetailOverlay.visibility == View.VISIBLE -> hideBookDetail()
             keyboardContainer.visibility == View.VISIBLE -> hideKeyboard()
             screen == Screen.READER -> closeBook()
             screen == Screen.GET_BOOKS || screen == Screen.SETTINGS -> showLibrary()
@@ -1217,22 +1635,33 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
     }
 
     private fun onDoubleTap() {
+        // Double-tap backs out of any overlay first, on every screen.
+        when {
+            confirmOverlay.visibility == View.VISIBLE -> { hideConfirm(); return }
+            bookMenuOverlay.visibility == View.VISIBLE -> { hideBookMenu(); return }
+            bookDetailOverlay.visibility == View.VISIBLE -> { hideBookDetail(); return }
+        }
         when (screen) {
             Screen.READER -> if (controlBar.visibility == View.VISIBLE) hideControlBar() else showControlBar()
-            Screen.LIBRARY -> when {
-                // Double-tap backs out of the book submenu / confirm first.
-                confirmOverlay.visibility == View.VISIBLE -> hideConfirm()
-                bookMenuOverlay.visibility == View.VISIBLE -> hideBookMenu()
-                // Otherwise it jumps back into the open book.
-                book != null -> showReader()
-                else -> {}
-            }
+            // Otherwise it jumps back into the open book.
+            Screen.LIBRARY -> if (book != null) showReader()
             else -> showLibrary()
         }
     }
 
     @Suppress("DEPRECATION")
     override fun onBackPressed() { onBack() }
+
+    // The temple click arrives as a KEY event. View-hierarchy key dispatch only
+    // reaches our layout while some view holds focus — and a screen rebuild
+    // (removeAllViews) silently drops focus, after which taps would go dead.
+    // The Activity sees every key regardless, so route center keys explicitly.
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        if (event.keyCode == android.view.KeyEvent.KEYCODE_BUTTON_A ||
+            event.keyCode == android.view.KeyEvent.KEYCODE_DPAD_CENTER
+        ) return binocular.dispatchKeyEvent(event)
+        return super.dispatchKeyEvent(event)
+    }
 
     // ---- Standard inline text field (paste via scrcpy Ctrl+V) --------------
 

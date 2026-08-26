@@ -20,4 +20,8 @@ local.properties
 .DS_Store
 Thumbs.db
 
-# Note: app/libs/*.aar (RayNeo Mercury / IPC SDKs) ARE tracked — the app cannot build without them.
+# The RayNeo Mercury / IPC SDK AARs used to be tracked here on the belief
+# that the app could not build without them. It can: nothing imports them,
+# a clean build succeeds without them, and the app runs on the glasses.
+# The launcher integration is three strings in AndroidManifest.xml and needs
+# no library at all. They were removed rather than republished.

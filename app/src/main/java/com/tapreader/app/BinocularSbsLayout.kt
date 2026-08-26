@@ -64,6 +64,10 @@ class BinocularSbsLayout @JvmOverloads constructor(
     var menuNavigationActive: (() -> Boolean)? = null
     /** Menu focus steps while [menuNavigationActive]: -1 = left, +1 = right. */
     var horizontalStepHandler: ((Int) -> Unit)? = null
+    /** Vertical focus steps while [menuNavigationActive]: -1 = up, +1 = down.
+     *  When wired, vertical travel steps focus (4-way hover navigation);
+     *  when null, the legacy swipe-up [menuDismissHandler] behavior applies. */
+    var verticalStepHandler: ((Int) -> Unit)? = null
     /** Deliberate swipe UP while the menu is active — conventional "dismiss". */
     var menuDismissHandler: (() -> Unit)? = null
 
@@ -95,6 +99,13 @@ class BinocularSbsLayout @JvmOverloads constructor(
     private var menuStepAccum = 0f
     private var lastMenuStepMs = 0L
     private var menuDismissAccum = 0f
+    private var vStepAccum = 0f
+    // Per-gesture axis commitment for focus stepping (see the axis-lock comment
+    // in handleGlassesInput). Reset on every touch-down.
+    private var menuAxisLock = AXIS_NONE
+    // True once the current center-key press has auto-repeated or been flagged
+    // long — its eventual UP is then the system's, never a tap.
+    private var keyHeldLong = false
     // Edge PULL gestures: with the cursor pinned at an edge, continued push in
     // that direction accumulates until it crosses the threshold (parking or
     // passing never triggers). The *Fired latches after one fire so a single
@@ -212,13 +223,29 @@ class BinocularSbsLayout @JvmOverloads constructor(
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val kc = event.keyCode
-        // Temple physical click = KEY event (X3 guide gotcha #1).
+        // Temple physical click = KEY event (X3 guide gotcha #1). Only SHORT
+        // presses are ours: a LONG press belongs to the SYSTEM (it summons the
+        // system menu), so downs are never consumed at all, a held press is
+        // remembered via its auto-repeats, and only a genuinely short UP
+        // becomes a tap.
         if (kc == KeyEvent.KEYCODE_BUTTON_A || kc == KeyEvent.KEYCODE_DPAD_CENTER) {
-            if (event.action == KeyEvent.ACTION_UP) {
-                pokeCursor()
-                onTapUp()
+            when (event.action) {
+                KeyEvent.ACTION_DOWN -> {
+                    if (event.repeatCount == 0) keyHeldLong = event.isLongPress
+                    else keyHeldLong = true
+                    return super.dispatchKeyEvent(event)
+                }
+                KeyEvent.ACTION_UP -> {
+                    val heldMs = event.eventTime - event.downTime
+                    if (keyHeldLong || event.isCanceled || heldMs >= LONG_PRESS_MS) {
+                        keyHeldLong = false
+                        return super.dispatchKeyEvent(event)
+                    }
+                    pokeCursor()
+                    onTapUp()
+                    return true
+                }
             }
-            return true
         }
         return super.dispatchKeyEvent(event)
     }
@@ -247,6 +274,8 @@ class BinocularSbsLayout @JvmOverloads constructor(
                 rightPullAccum = 0f; rightPullFired = false
                 menuStepAccum = 0f
                 menuDismissAccum = 0f
+                vStepAccum = 0f
+                menuAxisLock = AXIS_NONE
                 if (activeSide == Side.LEFT_VOLUME) {
                     leftVolumeStartY = rawY
                     leftVolumeStart = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
@@ -271,33 +300,71 @@ class BinocularSbsLayout @JvmOverloads constructor(
                 val dy = rawY - lastInputY
                 if (abs(dx) < 0.35f && abs(dy) < 0.35f) return true
                 if (menuNavigationActive?.invoke() == true) {
-                    // Focus-driven menu: horizontal travel becomes discrete focus
+                    // Focus-driven navigation: pad travel becomes discrete focus
                     // steps; the cursor parks so pointing accuracy is never needed.
-                    // De-twitch: only clearly horizontal motion counts (finger
-                    // wobble is mostly diagonal), and reversing direction restarts
-                    // the count instead of banking credit both ways.
-                    if (abs(dy) > abs(dx) * 1.2f) {
-                        // Deliberate upward swipe dismisses the menu; downward
-                        // movement drains the accumulator instead of banking it.
-                        menuDismissAccum = (menuDismissAccum - dy).coerceAtLeast(0f)
-                        if (menuDismissAccum >= MENU_DISMISS_PX) {
-                            menuDismissAccum = 0f
-                            menuDismissHandler?.invoke()
+                    //
+                    // AXIS LOCK: each gesture commits to its dominant axis after
+                    // MENU_AXIS_LOCK_PX of total travel from the touch-down point,
+                    // and only that axis can fire until liftoff. Without the lock,
+                    // per-event classification let thumb wobble on a horizontal
+                    // swipe bank vertical credit too — one swipe could fire a step
+                    // AND a vertical move, which read as items being skipped.
+                    if (menuAxisLock == AXIS_NONE) {
+                        val totX = localX - downInputX
+                        val totY = rawY - downInputY
+                        if (abs(totX) >= MENU_AXIS_LOCK_PX || abs(totY) >= MENU_AXIS_LOCK_PX) {
+                            // The temple pad is wide but SHORT: vertical travel is
+                            // physically cramped and thumbs arc, so mixed-direction
+                            // swipes are usually vertical intent. Only clearly flat
+                            // swipes lock horizontal.
+                            menuAxisLock = if (abs(totY) * VERTICAL_AXIS_BIAS > abs(totX))
+                                AXIS_VERTICAL else AXIS_HORIZONTAL
                         }
-                    } else if (abs(dx) > abs(dy) * 1.2f) {
-                        if (menuStepAccum != 0f && (menuStepAccum > 0f) != (dx > 0f)) menuStepAccum = 0f
+                    }
+                    // Bank travel while undecided or on the locked axis. A DELIBERATE
+                    // reversal (contrary delta past the noise floor) restarts the
+                    // count instead of crediting both ways — but zero/near-zero
+                    // deltas from the off-axis component must not wipe the bank,
+                    // or wobbly swipes silently lose their credit and go dead.
+                    if (menuAxisLock != AXIS_VERTICAL) {
+                        if (menuStepAccum != 0f && abs(dx) >= FLIP_RESET_MIN_PX &&
+                            (menuStepAccum > 0f) != (dx > 0f)) menuStepAccum = 0f
                         menuStepAccum += dx
-                        if (abs(menuStepAccum) >= MENU_STEP_PX) {
+                    }
+                    if (menuAxisLock != AXIS_HORIZONTAL) {
+                        if (vStepAccum != 0f && abs(dy) >= FLIP_RESET_MIN_PX &&
+                            (vStepAccum > 0f) != (dy > 0f)) vStepAccum = 0f
+                        vStepAccum += dy
+                        // Legacy dismiss accumulator: upward travel only, downward drains.
+                        menuDismissAccum = (menuDismissAccum - dy).coerceAtLeast(0f)
+                    }
+                    when (menuAxisLock) {
+                        AXIS_HORIZONTAL -> if (abs(menuStepAccum) >= MENU_STEP_PX) {
                             // One step per crossing, never banking the excess: a
                             // hard flick can't overshoot past the intended button,
                             // and the next step needs a fresh full swipe plus a
                             // beat of cooldown (a slow deliberate drag still walks
-                            // the bar at a controlled pace).
+                            // the focus at a controlled pace).
                             if (event.eventTime - lastMenuStepMs >= MENU_STEP_COOLDOWN_MS) {
+                                android.util.Log.i("TapReaderInput", "menu step H ${if (menuStepAccum > 0f) "+1" else "-1"}")
                                 horizontalStepHandler?.invoke(if (menuStepAccum > 0f) 1 else -1)
                                 lastMenuStepMs = event.eventTime
                             }
                             menuStepAccum = 0f
+                        }
+                        AXIS_VERTICAL -> if (verticalStepHandler != null) {
+                            if (abs(vStepAccum) >= MENU_STEP_V_PX) {
+                                if (event.eventTime - lastMenuStepMs >= MENU_STEP_COOLDOWN_MS) {
+                                    android.util.Log.i("TapReaderInput", "menu step V ${if (vStepAccum > 0f) "+1" else "-1"}")
+                                    verticalStepHandler?.invoke(if (vStepAccum > 0f) 1 else -1)
+                                    lastMenuStepMs = event.eventTime
+                                }
+                                vStepAccum = 0f
+                            }
+                        } else if (menuDismissAccum >= MENU_DISMISS_PX) {
+                            // Deliberate upward swipe dismisses the menu.
+                            menuDismissAccum = 0f
+                            menuDismissHandler?.invoke()
                         }
                     }
                     lastInputX = localX; lastInputY = rawY
@@ -327,7 +394,9 @@ class BinocularSbsLayout @JvmOverloads constructor(
                 }
                 val moved = abs(localX - downInputX) > touchSlop || abs(rawY - downInputY) > touchSlop
                 val ended = event.actionMasked == MotionEvent.ACTION_UP
-                if (!moved && ended) onTapUp()
+                // A long stationary hold is the system's long-press, not a tap.
+                val held = event.eventTime - event.downTime >= LONG_PRESS_MS
+                if (!moved && ended && !held) onTapUp()
                 currentInputUsesMirroredCoordinates = false
                 stopEdgeScroll()
                 leftPullAccum = 0f; leftPullFired = false
@@ -538,6 +607,23 @@ class BinocularSbsLayout @JvmOverloads constructor(
         private const val MENU_STEP_COOLDOWN_MS = 220L
         // Upward pad travel that dismisses the menu bar (swipe-up-to-close).
         private const val MENU_DISMISS_PX = 90f
+        // Total travel from touch-down before a gesture commits to one axis.
+        // Below MENU_STEP_PX so the lock always decides before any step fires.
+        private const val MENU_AXIS_LOCK_PX = 48f
+        // Vertical pad travel per step — lower than horizontal because the pad
+        // is short: a full-height flick only reports ~100–150px.
+        private const val MENU_STEP_V_PX = 70f
+        // Mixed-direction swipes lock vertical unless clearly flat (see above).
+        private const val VERTICAL_AXIS_BIAS = 1.4f
+        // Contrary per-event delta below this is wobble, not a reversal — it
+        // must not reset the step accumulator.
+        private const val FLIP_RESET_MIN_PX = 8f
+        // Presses held at least this long belong to the SYSTEM (long-press
+        // menu) — the app must neither consume them nor read them as taps.
+        private const val LONG_PRESS_MS = 450L
+        private const val AXIS_NONE = 0
+        private const val AXIS_HORIZONTAL = 1
+        private const val AXIS_VERTICAL = 2
         // Hide the crosshair after this long with no pad/temple activity.
         private const val CURSOR_HIDE_MS = 5_000L
     }

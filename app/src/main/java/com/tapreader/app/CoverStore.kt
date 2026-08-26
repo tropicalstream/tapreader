@@ -42,6 +42,55 @@ class CoverStore(private val context: Context, private val library: LibraryStore
 
     fun delete(fileName: String) { fileFor(fileName).delete() }
 
+    // ---- URL-keyed thumbnails (Get-free-books gallery) ----------------------
+
+    private val thumbMem = android.util.LruCache<String, Bitmap>(64)
+    // One network fetch per URL even when tiles race for the same cover; the
+    // loser blocks on the per-URL lock, then finds it cached.
+    private val inFlight = java.util.concurrent.ConcurrentHashMap<String, Any>()
+
+    /** Memory-cache only — safe on the UI thread. */
+    fun cachedThumb(url: String): Bitmap? = thumbMem.get(url)
+
+    /** Fetch + cache a catalog cover thumbnail. Call off the UI thread. */
+    fun loadOrFetchThumb(url: String): Bitmap? {
+        thumbMem.get(url)?.let { return it }
+        val f = thumbFileFor(url)
+        if (f.isFile) BitmapFactory.decodeFile(f.absolutePath)?.let {
+            thumbMem.put(url, it); return it
+        }
+        val lock = inFlight.computeIfAbsent(url) { Any() }
+        synchronized(lock) {
+            try {
+                thumbMem.get(url)?.let { return it }
+                if (f.isFile) BitmapFactory.decodeFile(f.absolutePath)?.let {
+                    thumbMem.put(url, it); return it
+                }
+                val bytes = getBytes(url) ?: return null
+                val bmp = decodeScaled(bytes) ?: return null
+                runCatching { f.writeBytes(bytes) }
+                    .onFailure { Log.w(TAG, "thumb cache failed: ${it.message}") }
+                thumbMem.put(url, bmp)
+                return bmp
+            } finally {
+                inFlight.remove(url)
+            }
+        }
+    }
+
+    /** Catalog covers ship large; the gallery tile needs ~300px. */
+    private fun decodeScaled(bytes: ByteArray): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        var sample = 1
+        while (bounds.outWidth / (sample * 2) >= 300) sample *= 2
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size,
+            BitmapFactory.Options().apply { inSampleSize = sample })
+    }
+
+    private fun thumbFileFor(url: String) =
+        File(directory, "thumb_${url.hashCode().toUInt().toString(16)}.cover")
+
     /** Free-text Open Library cover search for the companion's cover picker. */
     fun searchCovers(query: String): List<String> {
         return try {
