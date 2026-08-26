@@ -29,7 +29,12 @@ object BookSource {
         val author: String,
         val downloadUrl: String,
         val ext: String,
-        val coverUrl: String?
+        val coverUrl: String?,
+        /** Blurb shipped with the catalog entry (Gutendex provides these). */
+        val summary: String? = null,
+        /** Catalog page for a lazy summary fetch (Standard Ebooks). */
+        val bookPageUrl: String? = null,
+        val source: String = "Project Gutenberg"
     ) {
         fun suggestedFileName(): String {
             val base = (title.take(60) + if (author.isNotBlank()) " - ${author.take(30)}" else "")
@@ -66,7 +71,10 @@ object BookSource {
                     // instead — same book, ~30x smaller, quick on glasses Wi-Fi.
                     dl = dl.replace(Regex("\\.epub3?\\.images$"), ".epub.noimages")
                     val cover = formats.optString("image/jpeg", "").takeIf { it.isNotBlank() }
-                    out.add(Result(title, author, dl, ext, cover))
+                    val summary = o.optJSONArray("summaries")
+                        ?.takeIf { it.length() > 0 }?.optString(0)
+                        ?.takeIf { it.isNotBlank() }
+                    out.add(Result(title, author, dl, ext, cover, summary = summary))
                 }
                 out
             }
@@ -97,10 +105,17 @@ object BookSource {
                 .filter { it.second[2] != "downloads" }   // exclude .../downloads
                 .map { it.first }
                 .distinct().take(24).toList()
+            // The catalog page carries cover thumbnails; filenames embed the
+            // book slug (…/covers/<author>_<title>-<hash>-cover.jpg), so each
+            // path can be paired with its cover deterministically.
+            val coverPaths = Regex("/images/covers/[A-Za-z0-9._/-]+?\\.jpg")
+                .findAll(html).map { it.value }.distinct().toList()
             paths.mapNotNull { path ->
                 val parts = path.removePrefix("/ebooks/").split("/")
                 if (parts.size != 2) return@mapNotNull null
                 val slug = "${parts[0]}_${parts[1]}"
+                val cover = coverPaths.firstOrNull { it.contains(slug) }
+                    ?.let { "https://standardebooks.org$it" }
                 Result(
                     title = prettify(parts[1]),
                     author = prettify(parts[0]),
@@ -108,12 +123,46 @@ object BookSource {
                     // page and returns the actual epub bytes.
                     downloadUrl = "https://standardebooks.org$path/downloads/$slug.epub?source=download",
                     ext = "epub",
-                    coverUrl = null
+                    coverUrl = cover,
+                    bookPageUrl = "https://standardebooks.org$path",
+                    source = "Standard Ebooks"
                 )
             }
         } catch (e: Exception) {
             Log.w(TAG, "standard ebooks search failed: ${e.message}")
             emptyList()
+        }
+    }
+
+    /** Publisher's blurb from a Standard Ebooks book page (lazy, for the
+     *  detail overlay). Public catalog data — no account needed. */
+    fun fetchStandardEbooksSummary(pageUrl: String): String? {
+        return try {
+            val req = Request.Builder().url(pageUrl).header("User-Agent", "TapReader/1.0 (personal ereader)").build()
+            val html = http.newCall(req).execute().use { r ->
+                if (!r.isSuccessful) return null; r.body?.string().orEmpty()
+            }
+            val sec = Regex("(?is)<section[^>]*id=\"description\"[^>]*>(.*?)</section>")
+                .find(html)?.groupValues?.get(1) ?: return null
+            // Take the actual blurb paragraphs; skip SE's donation banner and
+            // the section heading, which share the description section.
+            Regex("(?is)<p[^>]*>(.*?)</p>").findAll(sec)
+                .map { m ->
+                    m.groupValues[1]
+                        .replace(Regex("<[^>]+>"), " ")
+                        .replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<")
+                        .replace("&gt;", ">").replace("&quot;", "\"").replace("&#8217;", "'")
+                        .replace(Regex("\\s+"), " ").trim()
+                }
+                .filter { it.isNotBlank() }
+                .filterNot {
+                    it.contains("donation", true) || it.contains("rely on your support", true) ||
+                        it.contains("support our efforts", true)
+                }
+                .joinToString("\n\n")
+                .take(2400).takeIf { it.isNotBlank() }
+        } catch (e: Exception) {
+            Log.w(TAG, "SE summary fetch failed: ${e.message}"); null
         }
     }
 

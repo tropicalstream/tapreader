@@ -71,6 +71,4 @@ dependencies {
     implementation("org.slf4j:slf4j-nop:2.0.9")
 
     // RayNeo X3 Pro SDKs (dual-projection / Mercury launcher integration).
-    implementation(files("libs/MercuryAndroidSDK-v0.2.2-20250717110238_48b655b3.aar"))
-    implementation(files("libs/RayNeoIPCSDK-For-Android-V0.1.0-20231128201840_9b41f025.aar"))
 }
