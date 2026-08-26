@@ -73,3 +73,15 @@ No API keys are needed to build or install the app. TTS (fish.audio), the readin
 - **[PdfBox-Android](https://github.com/TomRoush/PdfBox-Android)**, **[smbj](https://github.com/hierynomus/smbj)** — PDF text extraction and SMB access.
 
 TapReader is a personal, non-commercial project.
+
+---
+
+## License
+
+[MIT](LICENSE) — with a short project notice covering three things worth
+knowing before you use it: it is sample code rather than a finished product;
+it drives a display worn over your eyes, so do not read while driving,
+cycling or operating machinery; and the optional narration and reading-coach
+features send the text you are reading to fish.audio and Google Gemini
+respectively, under their terms rather than these. Both are off until you
+supply your own keys, and no key is needed to read a book.
