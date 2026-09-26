@@ -89,8 +89,16 @@ class TtsReader(private val context: Context) {
          * soft trailing-off pause, not a hard stop, so a phrase that trails off keeps
          * flowing into the next fragment instead of being cut into its own utterance.
          */
+        /** Titles and abbreviations whose full stop does not end a sentence. */
+        val ABBREVIATIONS = setOf("mr.", "mrs.", "ms.", "dr.", "st.", "mt.", "jr.", "sr.", "prof.", "capt.", "col.",
+            "gen.", "lt.", "sgt.", "rev.", "hon.", "messrs.", "mme.", "mlle.", "vs.", "etc.", "e.g.", "i.e.", "no.", "vol.", "ch.")
+
         fun endsSentence(token: String): Boolean {
             if (token.endsWith("...") || token.endsWith("…")) return false
+            val bare = token.trimStart('“', '"', '‘', '(', '[').lowercase()
+            if (bare in ABBREVIATIONS) return false
+            // Initials: "J." in "J. R. R. Tolkien".
+            if (bare.length == 2 && bare[0].isLetter() && bare[1] == '.' && token.trimStart('“', '"', '‘')[0].isUpperCase()) return false
             return token.endsWith(".") || token.endsWith("!") || token.endsWith("?") ||
                 token.endsWith(".\"") || token.endsWith(".”") || token.endsWith("!\"") ||
                 token.endsWith("!”") || token.endsWith("?\"") || token.endsWith("?”") ||

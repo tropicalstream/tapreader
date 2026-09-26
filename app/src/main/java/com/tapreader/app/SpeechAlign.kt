@@ -154,6 +154,43 @@ object SpeechAlign {
         return out.toShortArray()
     }
 
+    /**
+     * How much the voice's pitch moves: the spread (standard deviation, in
+     * semitones) of the fundamental frequency over voiced frames, found by
+     * autocorrelation. Lively reading moves 3-5 semitones; a flat, mechanical
+     * delivery stays under ~2. Returns (median pitch Hz, spread) or null when
+     * too little is voiced to tell.
+     */
+    fun pitchSpread(pcm: Pcm): Pair<Float, Float>? {
+        val sr = pcm.rate
+        val win = sr * 40 / 1000; val hop = sr / 100
+        val x = FloatArray(pcm.samples.size) { pcm.samples[it] / 32768f }
+        var total = 0.0; for (v in x) total += v * v
+        val rmsAll = sqrt(total / x.size.coerceAtLeast(1)).toFloat() + 1e-9f
+        val lo = sr / 400; val hi = sr / 70
+        val f0 = ArrayList<Float>()
+        var s = 0
+        while (s + win < x.size) {
+            var mean = 0f; for (k in 0 until win) mean += x[s + k]; mean /= win
+            var e = 0.0; for (k in 0 until win) { val v = x[s + k] - mean; e += v * v }
+            if (sqrt(e / win) >= rmsAll * 0.5) {
+                var best = 0.0; var bestLag = -1
+                for (lag in lo..hi) {
+                    var c = 0.0
+                    for (k in 0 until win - lag) c += (x[s + k] - mean).toDouble() * (x[s + k + lag] - mean)
+                    if (c > best) { best = c; bestLag = lag }
+                }
+                if (bestLag > 0 && best > 0.35 * e) f0 += sr.toFloat() / bestLag
+            }
+            s += hop
+        }
+        if (f0.size < 10) return null
+        val sorted = f0.sorted(); val median = sorted[sorted.size / 2]
+        val st = f0.map { 12.0 * log10(it / median.toDouble()) / log10(2.0) }
+        val m = st.average()
+        return median to sqrt(st.sumOf { (it - m) * (it - m) } / st.size).toFloat()
+    }
+
     /** The clip cut to [leadMs] before speech starts and [tailMs] after it ends. */
     fun trimmedWav(pcm: Pcm, leadMs: Int, tailMs: Int): ByteArray {
         // A far gentler threshold than alignment uses: soft onsets (h, s, f)
@@ -260,6 +297,7 @@ object SpeechAlign {
     /** Pause strength of the boundary AFTER [word]: 1 sentence, 0.7 clause, 0 none. */
     fun pauseAfter(word: String): Float {
         val t = word.trimEnd('”', '"', '’', '\'', ')', ']', '»', '_', '*')
+        if (t.trimStart('“', '"', '‘', '(').lowercase() in TtsReader.ABBREVIATIONS) return 0f   // "Mr." runs straight on
         return when {
             t.endsWith(".") || t.endsWith("!") || t.endsWith("?") || t.endsWith("…") -> 1f
             t.endsWith(",") || t.endsWith(";") || t.endsWith(":") || t.endsWith("—") || t.endsWith("–") || t.endsWith("-") -> 0.7f

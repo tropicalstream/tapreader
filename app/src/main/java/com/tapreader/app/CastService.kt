@@ -59,5 +59,12 @@ class CastService(
         d.save(cast)
     }
 
+    /** Re-auditions one character (their current voice excluded). Takes ~20 s. */
+    fun recast(book: Book, roleName: String) {
+        val d = director() ?: throw IllegalStateException("Character voices need both a fish.audio key and a Gemini key")
+        val (cast, _) = castFor(book, d)
+        d.recast(cast, roleName)
+    }
+
     fun reset(book: Book) = CastDirector.forgetInBackground(castDir, book.id)
 }

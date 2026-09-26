@@ -386,6 +386,33 @@ class CastDirector(
     // ---- Voices (fish.audio library) --------------------------------------------
 
     private val searchPool = Executors.newFixedThreadPool(4) { r -> Thread(r, "fish-search").apply { isDaemon = true } }
+    /** Separate from [searchPool]: auditions run there and wait on these test takes. */
+    private val takePool = Executors.newFixedThreadPool(6) { r -> Thread(r, "fish-take").apply { isDaemon = true } }
+
+    /**
+     * Throws out [name]'s voice and casts them again from the library, audition
+     * included (their current voice is excluded). For a voice that sounds wrong
+     * in practice — "Mr. Bennet sounds mechanical".
+     */
+    fun recast(cast: Cast, name: String) {
+        val (r, old) = synchronized(cast) {
+            val r = cast.role(name) ?: throw IllegalArgumentException("No such character")
+            val old = r.voice
+            r.voice = ""; r.voiceSource = "library"
+            if (r !== cast.narrator) r.major = true           // always audition a recast
+            r to old
+        }
+        rejected.getOrPut(cast.bookId) { java.util.Collections.synchronizedSet(HashSet()) } += old
+        if (r === cast.narrator) runCatching { castFromLibrary(cast, listOf(r)) } else assignVoices(cast)
+        synchronized(cast) {
+            if (r.voice.isBlank()) { r.voice = old; r.voiceSource = "library" }
+            if (r === cast.narrator) cast.roles.values.filter { it.voiceSource == "narrator" }.forEach { it.voice = r.voice }
+        }
+        save(cast)
+    }
+
+    /** Voices thrown out by [recast], per book: never offered again. */
+    private val rejected = ConcurrentHashMap<String, MutableSet<String>>()
 
     /** Chooses fish.audio voices for the narrator and every character still without one. */
     fun assignVoices(cast: Cast) {
@@ -428,22 +455,67 @@ class CastDirector(
     }
 
     /** Relevance searches: Gemini's own phrases, plus accent + gender (+ "narrator"). */
-    /** Each candidate speaks a line; Gemini listens and names the best fit for [r]. */
+    /** Characters meant to sound mechanical (ship computers, robots) are exempt from the liveliness test. */
+    private fun meantToBeMechanical(r: Role): Boolean {
+        val t = (r.name + " " + r.sketch).lowercase()
+        return listOf("robot", "computer", "synthes", "artificial intelligence", " ai ", "android", "machine", "automated", "mechanical", "monotone").any { it in t }
+    }
+
+    /**
+     * Auditions [voices] for [r] by ear. Each candidate performs two contrasting
+     * lines in one clip, using delivery directions this character actually gets
+     * in the book — a voice that sounds fine on a neutral sentence can go flat
+     * when asked to act. The app measures each clip's pitch movement, and Gemini
+     * listens for fit (gender, age, accent) and for a mechanical delivery
+     * (robotic timbre, monotone pitch, clipped words, identical sentence endings).
+     * Mechanical voices are ruled out unless the character is meant to be one.
+     * Returns null when no candidate passes.
+     */
     private fun audition(cast: Cast, r: Role, voices: List<FishSpeech.Voice>): FishSpeech.Voice? {
-        val line = if (r === cast.narrator) "It was later than anyone had expected, and the house was very quiet. Nobody knew yet what the morning would bring."
-            else "Well, I suppose that settles it, then. Shall we go and see for ourselves?"
-        val clips = voices.mapIndexed { i, v -> "ABC"[i].toString() to searchPool.submit<ByteArray?> { runCatching { fish.synthesize(line, v.id) }.getOrNull() } }
-            .mapNotNull { (label, f) -> runCatching { f.get(60, TimeUnit.SECONDS) }.getOrNull()?.let { label to it } }
-        if (clips.size < 2) return null
+        val isNarrator = r === cast.narrator
+        val directions = synchronized(cast) {
+            cast.quoteSpeaker.filter { it.value == r.name }.keys.mapNotNull { cast.quoteStyle[it]?.takeIf { s -> s.isNotBlank() } }
+        }.groupingBy { it }.eachCount().entries.sortedByDescending { it.value }.map { it.key }
+        val d1 = if (isNarrator) cast.narratorStyle else directions.getOrNull(0) ?: "wry, amused"
+        val d2 = if (isNarrator) "tense, hushed" else directions.getOrNull(1)?.takeIf { it != d1 } ?: "surprised, emphatic"
+        val script = if (isNarrator)
+            "[$d1] It was later than anyone had expected, and the house was very quiet. [$d2] Then, from somewhere below, came the unmistakable sound of a door."
+        else "[$d1] Well, I suppose that settles it, then. Shall we go and see for ourselves? [$d2] You cannot be serious! After everything that has happened?"
+        // Two takes per voice, rated blind in one shuffled batch: fish renders
+        // vary take to take and a single paired comparison flipped its verdict,
+        // so each voice is judged on the average of its takes.
+        val takes = voices.flatMap { v -> listOf(v, v) }.map { v -> v to takePool.submit<ByteArray?> { runCatching { fish.synthesize(script, v.id) }.getOrNull() } }
+            .mapNotNull { (v, f) -> runCatching { f.get(60, TimeUnit.SECONDS) }.getOrNull()?.let { v to it } }
+            .shuffled(java.util.Random(r.name.hashCode().toLong()))
+        if (takes.map { it.first.id }.distinct().size < 2) return null
+        val labels = "ABCDEFGH"
+        val labelled = takes.mapIndexed { i, (v, wav) -> Triple(labels[i].toString(), v, wav) }
+        val spread = labelled.associate { (l, _, wav) -> l to SpeechAlign.parseWav(wav)?.let { SpeechAlign.pitchSpread(it)?.second } }
+        val measured = labelled.joinToString("; ") { (l, _, _) -> spread[l]?.let { "$l: %.1f semitones".format(it) } ?: "$l: unmeasured" }
+        val mechanicalOk = meantToBeMechanical(r)
         val want = listOf(r.gender, r.age, r.accent).filter { it.isNotBlank() }.joinToString(", ")
         val js = llm.generateJsonWithAudio(
-            """You are casting the ${if (r === cast.narrator) "narrator" else "character ${r.name}"} for an audiobook of "${cast.title}".
+            """You are auditioning voices for the ${if (isNarrator) "narrator" else "character ${r.name}"} in an audiobook of "${cast.title}".
                Wanted: $want. ${r.sketch}
-               Listen to each voice below. Judge gender, apparent age and accent from the sound, then pick the best fit (a clearly wrong gender or accent rules a voice out).
-               Return JSON: {"best":"A|B|C","why":"one short sentence"}""".trimIndent(), clips)
-        val best = js.optString("best").trim().take(1)
-        val idx = "ABC".indexOf(best)
-        return voices.getOrNull(idx)?.takeIf { clips.any { it.first == best } }?.also { log("audition ${r.name}: ${it.title} — ${js.optString("why").take(120)}") }
+               Each clip performs the same two lines with different deliveries; some clips may be the same voice. Rate every clip from its sound:
+                 fit — gender, apparent age and accent against what is wanted (1-5);
+                 mechanical — robotic or synthetic timbre, monotone or flat pitch, evenly clipped words, every sentence ending the same way (1 = natural, 5 = very mechanical);
+                 acting — does the delivery really change between the two lines (1-5).
+               Measured pitch movement (lively speech moves about 3-5 semitones; under 2 is flat): $measured.
+               Return JSON: {"ratings":[{"clip":"A","fit":n,"mechanical":n,"acting":n}]}""".trimIndent(), labelled.map { it.first to it.third })
+        val ratings = js.optJSONArray("ratings")?.let { a -> (0 until a.length()).mapNotNull { a.optJSONObject(it) } }?.associateBy { it.optString("clip") } ?: emptyMap()
+        data class Score(val v: FishSpeech.Voice, val fit: Double, val mech: Double, val act: Double, val pitch: Double)
+        val scores = labelled.groupBy { it.second.id }.map { (_, ts) ->
+            val rs = ts.mapNotNull { ratings[it.first] }
+            fun avg(k: String) = rs.map { it.optInt(k).toDouble() }.filter { it > 0 }.average().takeIf { !it.isNaN() } ?: 3.0
+            Score(ts[0].second, avg("fit"), avg("mechanical"), avg("acting"), ts.mapNotNull { spread[it.first]?.toDouble() }.average().takeIf { !it.isNaN() } ?: 3.0)
+        }
+        log("audition ${r.name}: " + scores.joinToString(" ") { "${it.v.title.take(20)}[fit %.1f mech %.1f act %.1f %.1fst]".format(it.fit, it.mech, it.act, it.pitch) })
+        // Ruled out: a clear misfit, or (unless meant to be) mechanical by ear or flat by measurement.
+        val eligible = scores.filter { it.fit >= 3.0 && (mechanicalOk || (it.mech < 3.0 && it.pitch >= 2.0)) }
+        val best = eligible.maxByOrNull { it.fit * 1.0 + it.act * 0.6 - it.mech * 0.8 + it.pitch.coerceAtMost(5.0) * 0.3 } ?: return null
+        log("audition ${r.name} → ${best.v.title}")
+        return best.v
     }
 
     private fun queries(r: Role, isNarrator: Boolean): List<String> {
@@ -464,7 +536,8 @@ class CastDirector(
      * cast are excluded, so characters stay distinguishable).
      */
     private fun castFromLibrary(cast: Cast, roles: List<Role>) {
-        val taken = synchronized(cast) { (cast.roles.values.map { it.voice } + cast.narrator.voice).filter { it.isNotBlank() }.toSet() }
+        val taken = synchronized(cast) { (cast.roles.values.map { it.voice } + cast.narrator.voice).filter { it.isNotBlank() }.toSet() } +
+            rejected[cast.bookId].orEmpty()
         val lang = cast.language.substringBefore('-').lowercase().ifBlank { "en" }
         val candidates = roles.associateWith { r ->
             val isNarrator = r === cast.narrator
@@ -511,7 +584,7 @@ class CastDirector(
             You are casting voices for an audiobook of "${cast.title}" from a community voice library. For each role below, choose the ONE candidate voice (by its v-number) whose name, tags and description best fit the role's gender, age, accent and manner. Prefer voices that are plainly the right gender and age, then accent and manner; among equals prefer heavily used ones (more reliable). For the narrator prefer voices tagged narration.
             Never choose a voice that imitates a real person (celebrities, streamers, politicians, named people) or a famous fictional character or franchise (games, anime, films) — pick generic voices only.
             Every role must get a different voice. If no candidate fits a role at all, give an empty list.
-            Return JSON, your best three per role in order: {"choices":[{"role":"<role name exactly as written after ##>","voices":["v12","v3","v7"]}]}
+            Return JSON, your best five per role in order: {"choices":[{"role":"<role name exactly as written after ##>","voices":["v12","v3","v7","v1","v9"]}]}
             $listing
         """.trimIndent()
         val js = llm.generateJson(prompt, fast = true)
@@ -532,7 +605,11 @@ class CastDirector(
         // speaks a line and Gemini listens before choosing.
         val auditioned = HashMap<Role, FishSpeech.Voice>()
         val lead = shortlist.filter { (r, l) -> (r === cast.narrator || r.major) && l.size >= 2 }
-        lead.map { (r, l) -> r to searchPool.submit<FishSpeech.Voice?> { runCatching { audition(cast, r, l.take(3)) }.onFailure { log("audition ${r.name} failed: ${it.message}") }.getOrNull() } }
+        // Two rounds: if all of the top three are ruled out, the next ones audition.
+        lead.map { (r, l) -> r to searchPool.submit<FishSpeech.Voice?> {
+            runCatching { audition(cast, r, l.take(3)) ?: l.drop(3).takeIf { it.size >= 2 }?.let { audition(cast, r, it.take(3)) } }
+                .onFailure { log("audition ${r.name} failed: ${it.message}") }.getOrNull()
+        } }
             .forEach { (r, f) -> runCatching { f.get(90, TimeUnit.SECONDS) }.getOrNull()?.let { auditioned[r] = it } }
         synchronized(cast) {
             // Leads first (their ears-on choice), then everyone else, keeping voices distinct.

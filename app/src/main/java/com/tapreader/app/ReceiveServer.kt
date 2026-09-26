@@ -128,6 +128,7 @@ class ReceiveServer(
                 method == "GET" && path.startsWith("/api/v1/cast") -> castGet(out, query(path, "file"))
                 method == "POST" && path.startsWith("/api/v1/cast/voice") -> castSetVoice(out, json(body))
                 method == "POST" && path.startsWith("/api/v1/cast/reset") -> castReset(out, json(body).optString("file"))
+                method == "POST" && path.startsWith("/api/v1/cast/recast") -> castRecast(out, json(body))
                 method == "POST" && path.startsWith("/api/v1/keys/test") -> testKey(out, json(body))
                 method == "POST" && path.startsWith("/api/v1/coach") -> coach(out, json(body).optString("file"))
                 method == "GET" && path.startsWith("/api/v1/sources/popular") -> sourcesPopular(out, query(path, "source"))
@@ -306,6 +307,13 @@ class ReceiveServer(
         runCatching { casts.setVoice(b, body.optString("role"), body.optString("voice")); casts.castJson(b) }.fold(
             onSuccess = { respondJson(out, it.toString()) },
             onFailure = { respond(out, 422, it.message ?: "Could not change the voice") })
+    }
+
+    private fun castRecast(out: OutputStream, body: JSONObject) {
+        val b = parseBook(body.optString("file")) ?: run { respond(out, 404, "book not found"); return }
+        runCatching { casts.recast(b, body.optString("role")); casts.castJson(b) }.fold(
+            onSuccess = { respondJson(out, it.toString()) },
+            onFailure = { respond(out, 422, it.message ?: "Could not recast") })
     }
 
     private fun castReset(out: OutputStream, fileName: String) {
