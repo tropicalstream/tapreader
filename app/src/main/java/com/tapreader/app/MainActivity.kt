@@ -149,7 +149,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
     /**
      * Debug builds only — scripted on-glasses testing over adb:
      *   adb shell am start -n com.tapreader.app/.MainActivity --es open Book.epub --ei word 1234 --ez narrate true
-     *   … --ez stop true
+     *   … --ez stop true      … --ez toc true (open the chapter list)
      * Narration logs each clip (tag TapReader) and each highlighted word (tag TapReaderWord).
      */
     private fun handleTestIntent(i: Intent?) {
@@ -163,6 +163,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             val b = book ?: return@openBook
             if (word >= 0) { val w = word.coerceIn(0, b.wordCount - 1); reader.setFocus(w); actualReadPosition = w; if (configureTts()) tts.prepare(b, w) }
             if (narrate) toggleTts()
+            if (i.getBooleanExtra("toc", false)) showToc()
         }
     }
 
@@ -599,7 +600,9 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
         tocList.removeAllViews()
         val current = b.chapterAt(reader.focusIndex)
         for (i in b.chapterTitles.indices) {
-            val label = "${i + 1}.  ${b.chapterTitles[i].ifBlank { "Chapter ${i + 1}" }.take(46)}"
+            // The book's own chapter names, not "3.  Chapter 1": a number is added
+            // only when the title carries none of its own.
+            val label = b.chapterTitles[i].ifBlank { "Chapter ${i + 1}" }.take(50)
             tocList.addView(Button(this).apply {
                 text = if (i == current) "▶ $label" else label
                 isAllCaps = false; textSize = 13f; gravity = Gravity.START or Gravity.CENTER_VERTICAL
@@ -611,7 +614,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
                     hideToc()
                     reader.seekToChapter(i)
                     if (ttsOn) tts.start(b, reader.focusIndex)
-                    flash("Chapter ${i + 1}: ${b.chapterTitles[i].take(40)}")
+                    flash(b.chapterTitles[i].ifBlank { "Chapter ${i + 1}" }.take(50))
                     saveProgress()
                 }
             })
@@ -869,7 +872,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
         val b = book ?: return
         reader.seekToChapter(b.chapterAt(reader.focusIndex) + delta)
         if (ttsOn) tts.start(b, reader.focusIndex)
-        flash("Chapter ${b.chapterAt(reader.focusIndex) + 1}: ${b.chapterTitles.getOrElse(b.chapterAt(reader.focusIndex)) { "" }.take(40)}")
+        flash(b.chapterTitles.getOrElse(b.chapterAt(reader.focusIndex)) { "" }.ifBlank { "Chapter ${b.chapterAt(reader.focusIndex) + 1}" }.take(50))
     }
 
     private fun cycleMode() {
@@ -1558,7 +1561,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             val chapterPercent = if (end > start && actualWordsRead > 0) {
                 ((actualReadPosition - start + 1) * 100 / (end - start)).coerceIn(0, 100)
             } else 0
-            "«${b.title.take(22)}» ${if (b.wordCount > 0) actualWordsRead * 100 / b.wordCount else 0}% · Ch ${chapter + 1} $chapterPercent%"
+            "«${b.title.take(22)}» ${if (b.wordCount > 0) actualWordsRead * 100 / b.wordCount else 0}% · ${b.chapterShort(chapter)} $chapterPercent%"
         }
         val speaking = if (ttsOn && hudSpeaker.isNotBlank()) "   🗣 ${hudSpeaker.take(18)}" else ""
         topHud.text = "${hudClockFormat.format(Date())}   $power   ${networkStatus()}   $progress$speaking"

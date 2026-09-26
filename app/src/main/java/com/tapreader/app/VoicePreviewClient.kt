@@ -58,7 +58,9 @@ class VoicePreviewClient(private val library: LibraryStore) {
         val key = library.getString(LibraryStore.K_FISH_KEY, "").trim()
         if (key.isBlank()) return null
         val q = query.trim()
-        val url = StringBuilder("https://api.fish.audio/model?page_size=16&sort_by=task_count")
+        // A typed search ranks by relevance ("british gentleman" finds British
+        // gentlemen); with task_count it only listed the most popular voices.
+        val url = StringBuilder("https://api.fish.audio/model?page_size=16&sort_by=${if (q.isBlank()) "task_count" else "score"}")
         if (q.isNotBlank()) url.append("&title=").append(java.net.URLEncoder.encode(q, "UTF-8"))
         val request = Request.Builder().url(url.toString()).header("Authorization", "Bearer $key").get().build()
         val bodyStr = runCatching {

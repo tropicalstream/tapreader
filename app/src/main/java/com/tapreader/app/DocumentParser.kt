@@ -54,7 +54,12 @@ object DocumentParser {
      * detection. Chapters are inferred from blank-line-separated headings that
      * look like "Chapter N", roman numerals, or all-caps short lines.
      */
-    fun fromText(raw: String, title: String, author: String, format: String): Book {
+    /**
+     * [numberSequence] carries the expected next bare chapter number across calls,
+     * so an EPUB split over several files keeps counting (1 … 35) instead of
+     * restarting at 1 in each file.
+     */
+    fun fromText(raw: String, title: String, author: String, format: String, numberSequence: IntArray = intArrayOf(1)): Book {
         // Non-breaking and typographic spaces are word gaps too (Java's \s misses
         // them, which glued words together in some EPUBs and broke quote pairing).
         val text = stripGutenbergBoilerplate(raw).replace("\r\n", "\n").replace('\r', '\n')
@@ -68,16 +73,30 @@ object DocumentParser {
         var atParagraphStart = true
         var pendingBlank = true
         var i = 0
-        for (line in lines) {
+        // Bare chapter numbers ("1" / "IV." alone between blank lines) count only
+        // while they run in sequence, so a stray number in the text is never a chapter.
+        for ((lineIdx, line) in lines.withIndex()) {
             val trimmed = line.trim()
             if (trimmed.isEmpty()) { atParagraphStart = true; pendingBlank = true; continue }
 
-            if (pendingBlank && looksLikeHeading(trimmed) && words.isNotEmpty()) {
+            val number = if (pendingBlank && lines.getOrNull(lineIdx + 1)?.isBlank() != false) bareNumber(trimmed) else null
+            if (number != null && number == numberSequence[0]) {
+                numberSequence[0]++
+                if (words.isEmpty()) chapterTitles[0] = "Chapter $number"
+                else { chapterStarts.add(words.size); chapterTitles.add("Chapter $number") }
+            } else if (pendingBlank && looksLikeHeading(trimmed) && words.isNotEmpty()) {
                 chapterStarts.add(words.size)
                 chapterTitles.add(trimmed.take(60))
             }
             pendingBlank = false
 
+            // Some EPUBs break paragraphs mid-sentence (every printed line its own
+            // paragraph). A "paragraph" that starts in lowercase right after one
+            // that did not finish a sentence is the same paragraph continuing.
+            if (atParagraphStart && words.isNotEmpty() && trimmed[0].isLowerCase()) {
+                val prev = words.last().text
+                if (!TtsReader.endsSentence(prev) && !prev.endsWith(":") && !prev.endsWith("”") && !prev.endsWith("\"")) atParagraphStart = false
+            }
             var first = true
             for (tok in trimmed.split(Regex("\\s+"))) {
                 if (tok.isEmpty()) continue
@@ -120,6 +139,19 @@ object DocumentParser {
         RegexOption.IGNORE_CASE
     )
 
+    /** "12", "12.", "XII", "XII." → its value; anything else null. */
+    private fun bareNumber(line: String): Int? {
+        val t = line.trimEnd('.')
+        if (t.length in 1..3 && t.all { it.isDigit() }) return t.toInt()
+        if (t.length in 1..7 && ROMAN.matches(t)) {
+            val v = mapOf('I' to 1, 'V' to 5, 'X' to 10, 'L' to 50, 'C' to 100, 'D' to 500, 'M' to 1000)
+            var total = 0
+            for (k in t.indices) { val c = v.getValue(t[k]); val n = if (k + 1 < t.length) v.getValue(t[k + 1]) else 0; total += if (c < n) -c else c }
+            return total
+        }
+        return null
+    }
+
     private fun looksLikeHeading(line: String): Boolean {
         if (line.length > 64) return false
         if (HEADING.matches(line)) return true
@@ -157,15 +189,22 @@ object DocumentParser {
      * archive order (good enough for the vast majority of books), strip tags,
      * and treat each document as a chapter boundary.
      */
+    /** One entry of an EPUB's own table of contents. */
+    private class TocEntry(val index: Int, val label: String, val file: String, val frag: String?, val depth: Int) {
+        var position = -1
+    }
+
+    private const val MARK = '\u0001'
+
     private fun parseEpub(file: File, fallbackTitle: String): Book {
-        val chapters = ArrayList<Pair<String, String>>() // name -> plain text
+        val docs = ArrayList<Pair<String, String>>() // name -> raw html
         var metaTitle = ""
         var metaAuthor = ""
+        var opfXml: String? = null
+        var ncxXml: String? = null
         try {
             ZipInputStream(file.inputStream().buffered()).use { zin ->
                 var entry = zin.nextEntry
-                val docs = ArrayList<Pair<String, String>>()
-                var opfXml: String? = null
                 while (entry != null) {
                     val name = entry.name.lowercase()
                     if (!entry.isDirectory) {
@@ -174,44 +213,68 @@ object DocumentParser {
                             opfXml = opf
                             metaTitle = extractTag(opf, "dc:title") ?: extractTag(opf, "title").orEmpty()
                             metaAuthor = extractTag(opf, "dc:creator") ?: extractTag(opf, "creator").orEmpty()
+                        } else if (name.endsWith(".ncx")) {
+                            ncxXml = zin.readBytes().toString(Charsets.UTF_8)
                         } else if (name.endsWith(".xhtml") || name.endsWith(".html") || name.endsWith(".htm")) {
-                            val html = zin.readBytes().toString(Charsets.UTF_8)
-                            docs.add(entry.name to stripTags(html))
+                            docs.add(entry.name to zin.readBytes().toString(Charsets.UTF_8))
                         }
                     }
                     entry = zin.nextEntry
                 }
-                // Reading order comes from the OPF spine — the book's own sequence.
-                // Plain alphabetical sorting scrambles it ("chapter-10" before
-                // "chapter-2"), which shuffled the ToC. Natural numeric comparison
-                // is the fallback for EPUBs with no usable spine.
-                val spine = opfXml?.let(::spineOrder) ?: emptyMap()
-                docs.sortWith(
-                    compareBy<Pair<String, String>> { spine[baseName(it.first)] ?: Int.MAX_VALUE }
-                        .thenComparator { a, b -> naturalCompare(a.first, b.first) }
-                )
-                chapters.addAll(docs)
             }
         } catch (e: Exception) {
             Log.w(TAG, "epub parse failed: ${e.message}")
         }
-        if (chapters.isEmpty()) return fromText("Could not read this EPUB.", fallbackTitle, "", "epub")
+        // Reading order comes from the OPF spine — the book's own sequence.
+        // Plain alphabetical sorting scrambles it ("chapter-10" before
+        // "chapter-2"). Natural numeric comparison is the fallback for EPUBs with
+        // no usable spine. Documents outside a spine (the nav file) are not read.
+        val spine = opfXml?.let(::spineOrder) ?: emptyMap()
+        val navDoc = docs.firstOrNull { (_, html) -> Regex("<nav[^>]*epub:type=\"toc\"").containsMatchIn(html) }
+        val reading = docs.filter { spine.isEmpty() || spine.containsKey(baseName(it.first)) }
+            .ifEmpty { docs }
+            .sortedWith(compareBy<Pair<String, String>> { spine[baseName(it.first)] ?: Int.MAX_VALUE }
+                .thenComparator { x, y -> naturalCompare(x.first, y.first) })
+        if (reading.isEmpty()) return fromText("Could not read this EPUB.", fallbackTitle, "", "epub")
 
-        // Build a combined Book with real chapter boundaries.
+        // The book's own table of contents: EPUB 3 nav (its "toc" list only — not
+        // the page list or landmarks), else the EPUB 2 NCX.
+        val toc = navDoc?.second?.let(::navEntries)?.takeIf { it.size >= 2 } ?: ncxXml?.let(::ncxEntries) ?: emptyList()
+        val byFile = toc.groupBy { it.file }
+
+        // Build the words. Each TOC target gets a marker token placed just before
+        // the element it points at; the marker's position becomes the chapter
+        // start and the marker itself is dropped, so the words are unchanged.
         val words = ArrayList<Word>()
-        val starts = ArrayList<Int>()
-        val titles = ArrayList<String>()
-        for ((idx, ch) in chapters.withIndex()) {
-            val chBook = fromText(ch.second, "c", "", "epub")
-            if (chBook.words.isEmpty()) continue
-            starts.add(words.size)
-            titles.add(guessChapterTitle(ch.second, idx))
+        val fileStarts = ArrayList<Int>(); val fileTitles = ArrayList<String>()
+        val headStarts = ArrayList<Int>(); val headTitles = ArrayList<String>()
+        val pending = ArrayList<TocEntry>()
+        var carryBreak = false
+        val numberSequence = intArrayOf(1)
+        for ((idx, doc) in reading.withIndex()) {
+            val plain = stripTags(withMarkers(doc.second, byFile[baseName(doc.first)].orEmpty()))
+            val chBook = fromText(plain, "c", "", "epub", numberSequence)
+            if (chBook.words.none { it.text[0] != MARK }) { pending += markerEntries(chBook, toc); continue }
+            fileStarts.add(words.size)
+            fileTitles.add(guessChapterTitle(plain.replace(Regex("${MARK}T\\d+$MARK"), ""), idx))
+            val headingAt = chBook.chapterStarts.drop(1).zip(chBook.chapterTitles.drop(1)).toMap()
             val base = if (words.isEmpty()) 0 else words.last().charStart + words.last().text.length + 2
-            for (w in chBook.words) {
-                words.add(w.copy(charStart = base + w.charStart))
+            for ((k, w) in chBook.words.withIndex()) {
+                if (w.text.length > 2 && w.text[0] == MARK) {
+                    w.text.trim(MARK).removePrefix("T").toIntOrNull()?.let { n -> toc.getOrNull(n)?.let { pending += it } }
+                    carryBreak = carryBreak || w.paragraphBreak
+                    continue
+                }
+                headingAt[k]?.let { t -> headStarts.add(words.size); headTitles.add(t) }
+                for (e in pending) e.position = words.size
+                pending.clear()
+                words.add(w.copy(charStart = base + w.charStart, paragraphBreak = w.paragraphBreak || carryBreak))
+                carryBreak = false
             }
         }
-        if (starts.isEmpty()) { starts.add(0); titles.add("Full text") }
+        val (starts, titles) = tocChapters(toc)
+            ?: headingChapters(headStarts, headTitles)
+            ?: (fileStarts.ifEmpty { listOf(0) } to fileTitles.ifEmpty { listOf("Full text") })
         return Book(
             id = fallbackTitle.hashCode().toString(),
             title = metaTitle.ifBlank { fallbackTitle },
@@ -221,6 +284,139 @@ object DocumentParser {
             chapterTitles = titles,
             format = "epub"
         )
+    }
+
+    private fun markerEntries(chBook: Book, toc: List<TocEntry>): List<TocEntry> =
+        chBook.words.mapNotNull { w -> w.text.trim(MARK).removePrefix("T").toIntOrNull()?.let { toc.getOrNull(it) } }
+
+    /** Inserts " ␁T<n>␁ " before the element each entry targets (file start when it has no fragment). */
+    private fun withMarkers(html: String, entries: List<TocEntry>): String {
+        if (entries.isEmpty()) return html
+        val bodyStart = Regex("(?i)<body[^>]*>").find(html)?.range?.last?.plus(1) ?: 0
+        val inserts = entries.map { e ->
+            val at = e.frag?.let { f ->
+                Regex("\\b(?:id|name)=[\"']${Regex.escape(f)}[\"']").find(html)?.range?.first?.let { html.lastIndexOf('<', it) }
+            }?.takeIf { it >= 0 } ?: bodyStart
+            maxOf(at, bodyStart) to " ${MARK}T${e.index}$MARK "
+        }.sortedByDescending { it.first }
+        val sb = StringBuilder(html)
+        for ((at, text) in inserts) sb.insert(at, text)
+        return sb.toString()
+    }
+
+    private fun navEntries(html: String): List<TocEntry> {
+        val m = Regex("(?is)<nav[^>]*epub:type=\"toc\"[^>]*>(.*?)</nav>").find(html) ?: return emptyList()
+        val out = ArrayList<TocEntry>()
+        var depth = 0
+        for (t in Regex("(?is)<ol[^>]*>|</ol>|<a\\s[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>").findAll(m.groupValues[1])) {
+            when {
+                t.value.startsWith("</ol", true) -> depth--
+                t.value.startsWith("<ol", true) -> depth++
+                else -> tocEntry(out, t.groupValues[1], t.groupValues[2], depth)
+            }
+        }
+        return out
+    }
+
+    private fun ncxEntries(xml: String): List<TocEntry> {
+        val out = ArrayList<TocEntry>()
+        var depth = 0
+        var label = ""
+        for (t in Regex("(?is)<navPoint\\b|</navPoint>|<text>(.*?)</text>|<content[^>]*src=\"([^\"]+)\"").findAll(xml)) {
+            when {
+                t.value.startsWith("</navPoint", true) -> depth--
+                t.value.startsWith("<navPoint", true) -> depth++
+                t.value.startsWith("<text", true) -> label = t.groupValues[1]
+                else -> tocEntry(out, t.groupValues[2], label, depth)
+            }
+        }
+        return out
+    }
+
+    private fun tocEntry(out: MutableList<TocEntry>, href: String, rawLabel: String, depth: Int) {
+        val path = java.net.URLDecoder.decode(href.substringBefore('#'), "UTF-8")
+        val frag = href.substringAfter('#', "").ifBlank { null }
+        val label = cleanLabel(rawLabel)
+        if (label.isBlank() || path.isBlank()) return
+        // Page-number anchors some contents files list ("{vii}", "[Pg 2][Pg 3]", "12") are not chapters.
+        if (PAGE_LABEL.matches(label)) return
+        out += TocEntry(out.size, label, baseName(path), frag, depth)
+    }
+
+    /** Page anchors: bracketed ("{vii}", "[Pg 2][Pg 3]") or "Page 12" — never a bare numeral, which may be a real part. */
+    private val PAGE_LABEL = Regex("(?i)^(\\s*([\\[{(]\\s*(pg\\.?|page|p\\.)?\\s*[0-9ivxlcdm]+\\s*[\\]})]|(pg\\.?|page)\\s*[0-9]+))+$")
+    private val CHAPTER_WORD = Regex("(?i)\\b(chapter|book|part|volume|canto|act|letter|section)\\s+([0-9]+|[ivxlcdm]+)\\b")
+    private val ROMAN = Regex("^(?=[IVXLCDM])M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})[.,:]?$")
+    private val SMALL = setOf("a", "an", "and", "as", "at", "by", "for", "in", "of", "on", "or", "the", "to", "with")
+
+    /**
+     * A contents label as a reader wants it: tags and entities gone, a picture
+     * caption in front of the chapter name dropped ("He rode a black horse.
+     * CHAPTER III." → "Chapter III"), and SHOUTING turned to title case with
+     * roman numerals kept.
+     */
+    fun cleanLabel(raw: String): String {
+        var t = decodeEntities(raw.replace(Regex("<[^>]+>"), " ")).replace(Regex("\\s+"), " ").trim()
+        CHAPTER_WORD.find(t)?.let { if (it.range.first > 0) t = t.substring(it.range.first) }
+        t = t.trim().trimEnd('.', ',', ':', ';').trim()
+        val letters = t.filter { it.isLetter() }
+        // Shouting, even with a stray lowercase joiner ("PRIDE. and PREJUDICE").
+        if (letters.length > 2 && letters.count { it.isUpperCase() } >= letters.length * 3 / 4) {
+            t = t.split(' ').mapIndexed { i, w ->
+                when {
+                    ROMAN.matches(w) -> w
+                    i > 0 && w.lowercase() in SMALL && !ROMAN.matches(t.split(' ')[i - 1]) -> w.lowercase()
+                    else -> w.lowercase().replaceFirstChar { it.titlecase() }
+                }
+            }.joinToString(" ")
+        } else {
+            // "CHAPTER 1. Loomings" → "Chapter 1. Loomings"
+            t = t.replace(Regex("^(CHAPTER|BOOK|PART|VOLUME|CANTO|ACT|LETTER|SECTION)\\b")) { it.value.lowercase().replaceFirstChar { c -> c.titlecase() } }
+        }
+        return t.take(80)
+    }
+
+    private val NAVIGATION_ONLY = Regex("(?i)^(cover|contents|table of contents|toc|landmarks|page list|start)$")
+
+    /**
+     * Chapter list from the book's own contents, when it resolved: navigation
+     * entries (Cover, Contents) dropped, sub-entries that are bare numerals named
+     * with their parent ("A Scandal in Bohemia · II"), and entries at the same
+     * spot collapsed to the most specific. Always starts at word 0.
+     */
+    private fun tocChapters(toc: List<TocEntry>): Pair<List<Int>, List<String>>? {
+        if (toc.size < 2) return null
+        val parents = HashMap<Int, String>()
+        val named = toc.filter { it.position >= 0 }.map { e ->
+            parents[e.depth] = e.label
+            val bare = ROMAN.matches(e.label) || e.label.trimEnd('.').all { it.isDigit() }
+            val label = if (bare && e.depth > 1) parents[e.depth - 1]?.let { "$it · ${e.label}" } ?: e.label else e.label
+            e.position to label
+        }
+        if (named.size < 2 || named.size < toc.size / 3) return null
+        val kept = named.filterIndexed { i, (_, l) -> i == 0 || !NAVIGATION_ONLY.matches(l) }
+            .sortedBy { it.first }
+        val collapsed = ArrayList<Pair<Int, String>>()
+        for (e in kept) {
+            // Same spot: keep the most specific (later) label — except at the very
+            // start, where Cover / Title Page / Copyright pile up; keep the first.
+            if (collapsed.isNotEmpty() && collapsed.last().first == e.first) { if (e.first > 0) collapsed[collapsed.size - 1] = e }
+            else collapsed += e
+        }
+        if (collapsed.size < 2) return null
+        if (collapsed[0].first > 0) collapsed.add(0, 0 to "Beginning")
+        val first = collapsed[0]
+        if (NAVIGATION_ONLY.matches(first.second)) collapsed[0] = 0 to "Beginning"
+        else if (first.first != 0) collapsed[0] = 0 to first.second
+        return collapsed.map { it.first } to collapsed.map { it.second }
+    }
+
+    /** Chapter list from headings found in the text ("Chapter 1"), for EPUBs without a usable contents. */
+    private fun headingChapters(starts: List<Int>, titles: List<String>): Pair<List<Int>, List<String>>? {
+        if (starts.size < 2) return null
+        val s = ArrayList(starts); val t = ArrayList(titles.map(::cleanLabel))
+        if (s[0] > 0) { s.add(0, 0); t.add(0, "Beginning") }
+        return s to t
     }
 
     // ---- DOCX --------------------------------------------------------------

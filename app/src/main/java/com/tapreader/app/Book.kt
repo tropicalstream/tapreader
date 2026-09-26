@@ -18,6 +18,19 @@ data class Book(
 ) {
     val wordCount: Int get() = words.size
 
+    /**
+     * A short name for chapter [i] for the status line: "Ch 12", "Book IV",
+     * "Part 2", else the title itself, clipped.
+     */
+    fun chapterShort(i: Int): String {
+        val t = chapterTitles.getOrNull(i).orEmpty()
+        Regex("(?i)^(chapter|book|part|volume|canto|act|letter|section)\\s+([0-9]+|[ivxlcdm]+)\\b").find(t)?.let { m ->
+            val kind = m.groupValues[1].lowercase()
+            return (if (kind == "chapter") "Ch" else kind.replaceFirstChar { it.titlecase() }) + " " + m.groupValues[2].uppercase()
+        }
+        return t.ifBlank { "Chapter ${i + 1}" }.take(22)
+    }
+
     fun chapterAt(wordIndex: Int): Int {
         var lo = 0; var hi = chapterStarts.size - 1; var ans = 0
         while (lo <= hi) {
