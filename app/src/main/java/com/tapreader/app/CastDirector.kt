@@ -359,6 +359,13 @@ class CastDirector(
             val sib = spans.firstOrNull { o -> o.id != s.id && sameParagraph(book, o, s) && cast.quoteSpeaker[o.id].let { it != null && it != Cast.UNKNOWN && it != Cast.NARRATOR } }
             cast.quoteSpeaker[s.id] = sib?.let { cast.quoteSpeaker[it.id] } ?: Cast.UNKNOWN
         }
+        // One speech, one voice: a speech carried on into the next paragraph
+        // keeps its speaker (an earlier window may have cast its start).
+        for (sp in spans) {
+            if (sp.continues < 0) continue
+            val prev = cast.quoteSpeaker[sp.continues] ?: continue
+            if (prev != Cast.UNKNOWN && prev != Cast.NARRATOR) cast.quoteSpeaker[sp.id] = prev
+        }
         js.optJSONArray("narration")?.let { a ->
             for (i in 0 until a.length()) {
                 val o = a.optJSONObject(i) ?: continue
@@ -585,6 +592,11 @@ object SpeechPlan {
 
     const val MIN_WORDS = 10
     const val MAX_WORDS = 48
+    /** Long speeches split only at sentence ends, in chunks of 30–60 words: a
+     *  2-minute take stalled playback while it synthesized, and a voice stays
+     *  the same person across chunks (checked by ear). */
+    const val MIN_QUOTE_WORDS = 30
+    const val MAX_QUOTE_WORDS = 60
 
     fun build(book: Book, d: Dialogue.Map, from: Int, to: Int, narratorChanges: Set<Int> = emptySet()): List<Utterance> {
         val out = ArrayList<Utterance>()
@@ -600,6 +612,13 @@ object SpeechPlan {
                 val prev = book.words[i - 1].text
                 val len = i - s
                 val sentenceEnd = TtsReader.endsSentence(prev)
+                if (q >= 0) {
+                    // Inside one spoken line: whole sentences only, never mid-clause.
+                    if (sentenceEnd && len >= MIN_QUOTE_WORDS) break
+                    if (len >= MAX_QUOTE_WORDS && SpeechAlign.pauseAfter(prev) > 0f) break
+                    if (len >= MAX_QUOTE_WORDS + 30) break
+                    i++; continue
+                }
                 if (book.words[i].paragraphBreak && sentenceEnd) break
                 if (sentenceEnd && len >= MIN_WORDS) break
                 if (len >= MAX_WORDS && (sentenceEnd || SpeechAlign.pauseAfter(prev) > 0f)) break

@@ -439,7 +439,7 @@ class TtsReader(private val context: Context) {
             // A chained player was already started by the framework.
             if (!mp.isPlaying && !paused) mp.start()
             val now = System.currentTimeMillis()
-            Log.i(TAG, "clip $index words ${u.startWord}-${u.endWord} speaker=${clip.speaker} dur=${mp.duration}ms " +
+            Log.i(TAG, "clip $index words ${u.startWord}-${u.endWord} q=${u.quoteId} speaker=${clip.speaker} dur=${mp.duration}ms " +
                 "handoff=${if (lastClipEnd > 0) now - lastClipEnd else -1}ms chained=${prepared != null} " +
                 "text=\"${book?.words?.subList(u.startWord, u.endWord)?.joinToString(" ") { it.text }?.take(80)}\"")
             onSpeaker?.invoke(clip.speaker)
