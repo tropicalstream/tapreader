@@ -18,6 +18,7 @@
     $$('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.view === view));
     $$('.view').forEach(v => v.classList.toggle('active', v.id === `${view}-view`));
     $('#page-title').textContent = ({library:'Your library', getbooks:'Get free books', coach:'Reading coach', voices:'Narration voices', nas:'Import from NAS', settings:'Glasses settings'})[view];
+    if (view === 'voices' && state.data) loadCast();
     if (view === 'getbooks' && !state.sourcesLoaded) { state.sourcesLoaded = true; sourceSearch(); loadRepos(); }
   }
   function renderMetrics() {
@@ -68,6 +69,26 @@
     $('#voice-count').textContent = `${voices.length} of 5 saved`;
     $('#voice-list').innerHTML = voices.length ? voices.map(v => `<label class="voice-row"><input type="radio" name="voice" value="${escapeHtml(v.id)}" ${v.id === settings.selectedVoice ? 'checked':''}><span class="voice-meta"><strong>${escapeHtml(v.name)}</strong><span>${escapeHtml(v.id)}</span></span><button type="button" data-preview="${escapeHtml(v.id)}">Preview</button><button type="button" class="delete-voice" data-delete-voice="${escapeHtml(v.id)}">Delete</button></label>`).join('') : '<p class="empty">No voices saved yet. Search below to add one.</p>';
     renderVoiceResults();
+    renderCastBooks();
+    if ($('#voices-view').classList.contains('active')) loadCast();
+  }
+  // ---- Characters (per-book cast) ------------------------------------------
+  function renderCastBooks() {
+    const books = state.data.books || [];
+    if (!state.castBook && books.length) state.castBook = books[0].file;
+    $('#cast-books').innerHTML = books.map(b => `<button type="button" class="coach-book ${b.file === state.castBook ? 'active' : ''}" data-cast-book="${escapeHtml(b.file)}"><span>${escapeHtml(b.title)}</span></button>`).join('');
+  }
+  async function loadCast() {
+    const el = $('#cast-list');
+    if (!state.castBook) { el.innerHTML = ''; return; }
+    try {
+      const c = await requestJson(`/api/v1/cast?file=${encode(state.castBook)}`);
+      $('#cast-reset').hidden = !c.ready;
+      $('#cast-status').textContent = c.ready ? `${(c.roles || []).length} characters · ${c.person} person${c.live ? ' · narrating now' : ''}` : 'Not cast yet';
+      if (!c.ready) { el.innerHTML = '<p class="empty">Not cast yet — start narration on the glasses (or re-send the book) and its cast appears here.</p>'; return; }
+      const row = r => `<article class="voice-hit"><div class="voice-hit-main"><strong>${escapeHtml(r.label)}</strong><span class="voice-hit-by">${escapeHtml([r.gender, r.age, r.accent].filter(Boolean).join(' · '))}${r.lines ? ` · ${r.lines} lines` : ''}</span><span class="voice-hit-tags">${escapeHtml(r.voiceName || r.voice)}${r.voiceSource === 'user' ? ' (your choice)' : ''}</span>${r.sketch ? `<span class="voice-hit-stats">${escapeHtml(r.sketch)}</span>` : ''}</div><div class="voice-hit-actions">${r.voice ? `<button type="button" data-preview="${escapeHtml(r.voice)}">Preview</button>` : ''}${r.voiceSource === 'narrator' ? '' : `<button type="button" data-change-role="${escapeHtml(r.name)}">Change</button>`}</div></article>`;
+      el.innerHTML = [row(c.narrator), ...(c.roles || []).map(row)].join('');
+    } catch (e) { $('#cast-status').textContent = ''; $('#cast-reset').hidden = true; el.innerHTML = `<p class="empty">${escapeHtml(e.message)}</p>`; }
   }
   function renderVoiceResults() {
     const el = $('#voice-results'), results = state.voiceResults;
@@ -80,7 +101,8 @@
       const stats = `♥ ${(r.likes || 0).toLocaleString()} · ${(r.uses || 0).toLocaleString()} uses`;
       const isSaved = saved.has(r.id);
       const disabled = isSaved || full ? 'disabled' : '';
-      return `<article class="voice-hit"><div class="voice-hit-main"><strong>${escapeHtml(r.title)}</strong><span class="voice-hit-by">${escapeHtml(r.author || 'fish.audio')}</span>${meta ? `<span class="voice-hit-tags">${escapeHtml(meta)}</span>` : ''}<span class="voice-hit-stats">${escapeHtml(stats)}</span></div><div class="voice-hit-actions"><button type="button" data-preview="${escapeHtml(r.id)}">Preview</button><button type="button" class="add-hit" data-add-voice="${escapeHtml(r.id)}" data-add-name="${escapeHtml(r.title)}" ${disabled}>${isSaved ? 'Saved' : full ? 'Full' : 'Add'}</button></div></article>`;
+      const use = state.pickRole ? `<button type="button" class="add-hit" data-use-voice="${escapeHtml(r.id)}" data-use-name="${escapeHtml(r.title)}">Use for ${escapeHtml(state.pickRole === 'NARRATOR' ? 'narrator' : state.pickRole)}</button>` : '';
+      return `<article class="voice-hit"><div class="voice-hit-main"><strong>${escapeHtml(r.title)}</strong><span class="voice-hit-by">${escapeHtml(r.author || 'fish.audio')}</span>${meta ? `<span class="voice-hit-tags">${escapeHtml(meta)}</span>` : ''}<span class="voice-hit-stats">${escapeHtml(stats)}</span></div><div class="voice-hit-actions"><button type="button" data-preview="${escapeHtml(r.id)}">Preview</button>${use}<button type="button" class="add-hit" data-add-voice="${escapeHtml(r.id)}" data-add-name="${escapeHtml(r.title)}" ${disabled}>${isSaved ? 'Saved' : full ? 'Full' : 'Add'}</button></div></article>`;
     }).join('');
   }
   function fillSettings() {
@@ -293,6 +315,9 @@
     const restore = event.target.closest('[data-restore]'); if (restore) { try { restore.disabled = true; restore.textContent = 'Restoring…'; await requestJson('/api/v1/books/restore',{method:'POST',body:JSON.stringify({file:restore.dataset.restore})}); await refresh(); notice('Restored to the glasses.'); } catch(e) { notice(e.message,true); await refresh(); } return; }
     const purge = event.target.closest('[data-purge]'); if (purge) return confirmAction('Delete forever?', 'This permanently deletes the book file and its reading progress. This cannot be undone.', async () => { try { await api(`/api/v1/books/purge?file=${encode(purge.dataset.purge)}`,{method:'DELETE'}); await refresh(); notice('Book deleted permanently.'); } catch(e) { notice(e.message,true); } });
     const preview = event.target.closest('[data-preview]'); if (preview) { try { notice('Generating voice preview…'); const response = await api('/api/v1/voice/preview',{method:'POST',body:JSON.stringify({id:preview.dataset.preview,text:'This is how I sound while reading with TapReader.'})}); const audio = new Audio(URL.createObjectURL(await response.blob())); audio.play(); notice(''); } catch(e) { notice(e.message,true); } }
+    const castBook = event.target.closest('[data-cast-book]'); if (castBook) { state.castBook = castBook.dataset.castBook; state.pickRole = null; $('#voice-finder-title').textContent = 'Find a voice on fish.audio'; renderCastBooks(); loadCast(); renderVoiceResults(); return; }
+    const change = event.target.closest('[data-change-role]'); if (change) { state.pickRole = change.dataset.changeRole; $('#voice-finder-title').textContent = `A new voice for ${state.pickRole === 'NARRATOR' ? 'the narrator' : state.pickRole}`; $('#voice-query').focus(); renderVoiceResults(); notice('Search for a voice below, then choose “Use for …”.'); return; }
+    const useVoice = event.target.closest('[data-use-voice]'); if (useVoice) { try { useVoice.disabled = true; await requestJson('/api/v1/cast/voice',{method:'POST',body:JSON.stringify({file:state.castBook,role:state.pickRole,voice:useVoice.dataset.useVoice})}); notice(`${state.pickRole === 'NARRATOR' ? 'The narrator' : state.pickRole} now speaks with “${useVoice.dataset.useName}”.`); state.pickRole = null; $('#voice-finder-title').textContent = 'Find a voice on fish.audio'; renderVoiceResults(); await loadCast(); } catch(e) { notice(e.message,true); useVoice.disabled = false; } return; }
     const addVoice = event.target.closest('[data-add-voice]'); if (addVoice) { try { const settings = await requestJson('/api/v1/voices',{method:'POST',body:JSON.stringify({id:addVoice.dataset.addVoice,name:addVoice.dataset.addName})}); state.data.settings = settings; renderVoices(); fillSettings(); notice(`Added “${addVoice.dataset.addName}” to your glasses.`); } catch(e) { notice(e.message,true); } }
     const voiceDelete = event.target.closest('[data-delete-voice]'); if (voiceDelete) return confirmAction('Delete voice?', 'This removes the saved voice from the glasses and companion.', async () => { try { const settings = await requestJson(`/api/v1/voices?id=${encode(voiceDelete.dataset.deleteVoice)}`,{method:'DELETE'}); state.data.settings = settings; renderVoices(); fillSettings(); } catch(e) { notice(e.message,true); } });
     const testKey = event.target.closest('[data-test-key]');
@@ -311,6 +336,7 @@
     }
   });
   $('#book-search').addEventListener('input', renderBooks); $('#settings-form').fontSp.addEventListener('input',syncOutputs); $('#settings-form').wpm.addEventListener('input',syncOutputs);
+  $('#cast-reset').addEventListener('click', () => { if (!state.castBook) return; confirmAction('Re-cast this book?', 'The glasses forget this book’s cast and choose its voices afresh the next time it is narrated.', async () => { try { await requestJson('/api/v1/cast/reset',{method:'POST',body:JSON.stringify({file:state.castBook})}); await loadCast(); notice('Cast cleared.'); } catch(e) { notice(e.message,true); } }); });
   $('#voice-finder').addEventListener('submit', event => { event.preventDefault(); searchVoices($('#voice-query').value.trim()); });
   $('#cover-form').addEventListener('submit', event => { event.preventDefault(); coverSearch(); });
   $('#source-form').addEventListener('submit', event => { event.preventDefault(); sourceSearch(); });

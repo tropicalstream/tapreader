@@ -25,3 +25,9 @@ Thumbs.db
 # a clean build succeeds without them, and the app runs on the glasses.
 # The launcher integration is three strings in AndroidManifest.xml and needs
 # no library at all. They were removed rather than republished.
+
+# Local test keys
+.fish_key
+.gemini_key
+testbooks/
+__pycache__/

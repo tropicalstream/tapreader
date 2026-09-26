@@ -25,6 +25,7 @@ import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.ScrollView
 import android.widget.TextView
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -51,6 +52,8 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
     private lateinit var summaryClient: SummaryClient
     private lateinit var covers: CoverStore
     private lateinit var tts: TtsReader
+    /** Who the narration is voicing right now, for the top HUD. */
+    private var hudSpeaker = ""
     private var receiver: ReceiveServer? = null
 
     private lateinit var binocular: BinocularSbsLayout
@@ -130,13 +133,37 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             onReceived = { name ->
                 // Refresh no matter which screen is up — rebuilding a hidden panel
                 // is cheap, and the library is guaranteed current when it appears.
-                main.post { flash("📚 Received: ${name.take(36)}"); refreshLibrary() }
+                main.post { flash("📚 Received: ${name.take(36)}"); refreshLibrary(); precast(name) }
             },
-            onLibraryChanged = { main.post { refreshLibrary() } }
+            onLibraryChanged = { main.post { refreshLibrary() } },
+            liveCast = { id -> tts.currentCast?.takeIf { it.bookId == id } }
         ).also { it.start() }
 
         refreshLibrary()
         showLibrary()
+        handleTestIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); handleTestIntent(intent) }
+
+    /**
+     * Debug builds only — scripted on-glasses testing over adb:
+     *   adb shell am start -n com.tapreader.app/.MainActivity --es open Book.epub --ei word 1234 --ez narrate true
+     *   … --ez stop true
+     * Narration logs each clip (tag TapReader) and each highlighted word (tag TapReaderWord).
+     */
+    private fun handleTestIntent(i: Intent?) {
+        if (!BuildConfig.DEBUG || i == null) return
+        if (i.getBooleanExtra("stop", false)) { stopTts(); return }
+        val file = i.getStringExtra("open") ?: return
+        val word = i.getIntExtra("word", -1)
+        val narrate = i.getBooleanExtra("narrate", false)
+        stopTts()
+        openBook(file) {
+            val b = book ?: return@openBook
+            if (word >= 0) { val w = word.coerceIn(0, b.wordCount - 1); reader.setFocus(w); actualReadPosition = w; if (configureTts()) tts.prepare(b, w) }
+            if (narrate) toggleTts()
+        }
     }
 
     override fun onDestroy() {
@@ -778,7 +805,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
         }
     }
 
-    private fun openBook(fileName: String) {
+    private fun openBook(fileName: String, then: (() -> Unit)? = null) {
         // Persist until parsing finishes — a large book can take seconds, and a
         // pill that fades early leaves the reader staring at a silent screen.
         flash("📖 Opening ${fileName.substringBeforeLast('.').replace('_', ' ').take(36)}…", persist = true)
@@ -791,11 +818,23 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
                 actualReadPosition = library.savedWordIndex(fileName).coerceIn(0, parsed.wordCount - 1)
                 actualWordsRead = library.shelf().firstOrNull { it.fileName == fileName }?.wordsRead ?: 0
                 reader.setBook(parsed, library.savedWordIndex(fileName))
+                // Cast the narrator and opening voices now, so play starts promptly.
+                if (configureTts()) tts.prepare(parsed, reader.focusIndex)
                 rebuildControlBar()
                 showReader()
                 flash("${parsed.title} · ${parsed.chapterTitles.getOrElse(parsed.chapterAt(reader.focusIndex)) { "" }}")
+                then?.invoke()
             }
         }.start()
+    }
+
+    /** A book that just arrived is cast in the background, so its first play starts at once. */
+    private fun precast(fileName: String) {
+        if (!DocumentParser.isSupported(fileName) || fileName.endsWith(".pdf", true) || !configureTts()) return
+        Thread({
+            val parsed = runCatching { DocumentParser.parse(this, File(library.booksDir, fileName)) }.getOrNull()
+            if (parsed != null && parsed.wordCount > 0) main.post { tts.prepare(parsed, library.savedWordIndex(fileName).coerceIn(0, parsed.wordCount - 1)) }
+        }, "precast").apply { isDaemon = true }.start()
     }
 
     private fun closeBook() { saveProgress(); stopTts(); showLibrary() }
@@ -849,9 +888,13 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
     // ---- TTS ---------------------------------------------------------------
 
     private fun wireTts() {
-        tts.onWord = { idx -> reader.setFocus(idx) }
+        tts.onWord = { idx ->
+            reader.setFocus(idx)
+            if (BuildConfig.DEBUG) book?.words?.getOrNull(idx)?.let { android.util.Log.d("TapReaderWord", "$idx ${it.text}") }
+        }
         tts.onError = { msg -> main.post { flash(msg) } }
         tts.onNotice = { msg -> main.post { flash(msg) } }
+        tts.onSpeaker = { who -> main.post { hudSpeaker = if (who == Cast.NARRATOR) "Narrator" else who; refreshHud() } }
         // TTS stopped itself (finished/errored): return control to the tap-pacer.
         tts.onStopped = { main.post { ttsOn = false; reader.ttsDriven = false; saveProgress(); rebuildControlBar() } }
     }
@@ -859,9 +902,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
     private fun toggleTts() {
         val b = book ?: return
         if (ttsOn) { stopTts(); return }
-        val key = library.getString(LibraryStore.K_FISH_KEY, "")
-        if (key.isBlank()) { flash("Add a fish.audio key in Settings for narration"); return }
-        tts.configure(key, library.getString(LibraryStore.K_FISH_VOICE, ""))
+        if (!configureTts()) { flash("Add a fish.audio key in Settings for narration"); return }
         reader.pause(); reader.ttsDriven = true
         ttsOn = true
         tts.start(b, reader.focusIndex)
@@ -872,8 +913,22 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
         rebuildControlBar()
     }
 
+    /** Applies the narration settings; false when there is no fish.audio key. */
+    private fun configureTts(): Boolean {
+        val key = library.getString(LibraryStore.K_FISH_KEY, "")
+        if (key.isBlank()) return false
+        tts.configure(
+            key, library.getString(LibraryStore.K_FISH_VOICE, ""),
+            geminiKey = library.getString(LibraryStore.K_GEMINI_KEY, ""),
+            multiVoice = library.getBool(LibraryStore.K_MULTI_VOICE, true),
+            narratorIsMine = library.getBool(LibraryStore.K_NARRATOR_MINE, false)
+        )
+        return true
+    }
+
     private fun stopTts() {
         main.removeCallbacks(scrubTtsRestart)
+        hudSpeaker = ""
         if (tts.isActive) tts.stop()
         reader.ttsDriven = false
         ttsOn = false
@@ -906,7 +961,7 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
         summaryClient.summarize(b.title, b.author, passage) { result ->
             main.post {
                 result.onSuccess { summary ->
-                    tts.configure(fishKey, library.getString(LibraryStore.K_FISH_VOICE, ""))
+                    configureTts()
                     flash("🔊 Section summary")
                     tts.speakOnce(summary)
                 }.onFailure { flash("Summary unavailable: ${it.message}") }
@@ -1377,6 +1432,29 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             flash("Voice set ✓"); refreshSettings()
         })
 
+        settingsList.addView(sectionTitle("🎭  Character voices"))
+        val hasGemini = library.getString(LibraryStore.K_GEMINI_KEY, "").isNotBlank()
+        settingsList.addView(hint(if (hasGemini)
+            "Gemini reads a little ahead, works out who says each line, and picks a fish.audio voice that suits each character. The first play of a new book takes a few seconds longer while it is cast."
+            else "Add a Gemini key (Reading coach / summary settings, or the companion) to give every character their own voice. Until then the chosen voice reads everything."))
+        settingsList.addView(choiceRow("Voices", listOf("A voice per character", "One voice"),
+            if (library.getBool(LibraryStore.K_MULTI_VOICE, true)) 0 else 1) {
+            library.putBool(LibraryStore.K_MULTI_VOICE, it == 0); restartTtsIfOn()
+        })
+        settingsList.addView(choiceRow("Narrator", listOf("Cast to suit each book", "My chosen voice"),
+            if (library.getBool(LibraryStore.K_NARRATOR_MINE, false)) 1 else 0) {
+            library.putBool(LibraryStore.K_NARRATOR_MINE, it == 1); restartTtsIfOn()
+        })
+        book?.let { b ->
+            tts.currentCast?.takeIf { it.bookId == b.id }?.let { c -> settingsList.addView(hint("Cast of «${b.title.take(30)}»: " + castSummary(c))) }
+            settingsList.addView(bigButton("Re-cast this book") {
+                stopTts()
+                tts.forgetCast(b.id)
+                CastDirector.forgetInBackground(File(filesDir, "casts"), b.id)
+                flash("Cast cleared — voices are chosen afresh next time"); refreshSettings()
+            })
+        }
+
         settingsList.addView(sectionTitle("📖  Section summary (AI)"))
         val sp = summaryClient.provider()
         settingsList.addView(hint("The 📖 Summary button reads an AI recap of the section you've read (with hard words defined), aloud via fish.audio. ${if (summaryClient.hasKey()) "✓ key saved" else "No key yet."}"))
@@ -1392,6 +1470,20 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
 
         settingsList.addView(spacer())
         settingsList.addView(bigButton("‹ Back to library") { showLibrary() })
+    }
+
+    private fun castSummary(c: Cast): String = synchronized(c) {
+        val lead = (listOf("Narrator" to c.narrator) + c.roles.values.filter { it.voiceSource != "narrator" }
+            .sortedByDescending { it.lines }.take(6).map { it.name to it })
+        lead.joinToString(" · ") { it.first } + if (c.roles.size > 6) " · +${c.roles.size - 6} more" else ""
+    }
+
+    /** Settings that shape the voices take effect from the current word. */
+    private fun restartTtsIfOn() {
+        refreshSettings()
+        val b = book ?: return
+        if (!ttsOn || !configureTts()) return
+        tts.start(b, reader.focusIndex)
     }
 
     private fun currentVoiceLabel(): String {
@@ -1468,7 +1560,8 @@ class MainActivity : Activity(), CustomKeyboardView.OnKeyboardActionListener {
             } else 0
             "«${b.title.take(22)}» ${if (b.wordCount > 0) actualWordsRead * 100 / b.wordCount else 0}% · Ch ${chapter + 1} $chapterPercent%"
         }
-        topHud.text = "${hudClockFormat.format(Date())}   $power   ${networkStatus()}   $progress"
+        val speaking = if (ttsOn && hudSpeaker.isNotBlank()) "   🗣 ${hudSpeaker.take(18)}" else ""
+        topHud.text = "${hudClockFormat.format(Date())}   $power   ${networkStatus()}   $progress$speaking"
     }
 
     private fun networkStatus(): String {

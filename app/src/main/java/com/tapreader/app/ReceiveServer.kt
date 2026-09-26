@@ -23,7 +23,9 @@ class ReceiveServer(
     private val onReceived: (fileName: String) -> Unit,
     /** Any companion-driven library mutation (delete/restore/reset/cover): the
      *  glasses' on-screen shelf must follow without user navigation. */
-    private val onLibraryChanged: () -> Unit = {}
+    private val onLibraryChanged: () -> Unit = {},
+    /** The cast narration holds in memory for a book id, so companion edits apply live. */
+    liveCast: (bookId: String) -> Cast? = { null }
 ) {
     companion object {
         const val PORT = 8787
@@ -34,6 +36,7 @@ class ReceiveServer(
     private val covers = CoverStore(context, library)
     private val coach = GeminiCoachClient(library)
     private val voicePreview = VoicePreviewClient(library)
+    private val casts = CastService(context, library, liveCast)
     @Volatile private var running = false
     private var server: ServerSocket? = null
 
@@ -122,6 +125,9 @@ class ReceiveServer(
                 method == "POST" && path.startsWith("/api/v1/voices") -> saveVoice(out, json(body))
                 method == "DELETE" && path.startsWith("/api/v1/voices") -> deleteVoice(out, query(path, "id"))
                 method == "POST" && path.startsWith("/api/v1/voice/preview") -> previewVoice(out, json(body))
+                method == "GET" && path.startsWith("/api/v1/cast") -> castGet(out, query(path, "file"))
+                method == "POST" && path.startsWith("/api/v1/cast/voice") -> castSetVoice(out, json(body))
+                method == "POST" && path.startsWith("/api/v1/cast/reset") -> castReset(out, json(body).optString("file"))
                 method == "POST" && path.startsWith("/api/v1/keys/test") -> testKey(out, json(body))
                 method == "POST" && path.startsWith("/api/v1/coach") -> coach(out, json(body).optString("file"))
                 method == "GET" && path.startsWith("/api/v1/sources/popular") -> sourcesPopular(out, query(path, "source"))
@@ -249,7 +255,9 @@ class ReceiveServer(
 
     private fun purgeBook(out: OutputStream, fileName: String?) {
         if (fileName.isNullOrBlank()) { respond(out, 400, "no file"); return }
-        covers.delete(fileName); library.purge(fileName); onLibraryChanged(); respondJson(out, "{\"ok\":true}")
+        covers.delete(fileName); library.purge(fileName); onLibraryChanged()
+        CastDirector.forgetInBackground(File(context.filesDir, "casts"), DocumentParser.bookIdFor(fileName))
+        respondJson(out, "{\"ok\":true}")
     }
 
     private fun resetBook(out: OutputStream, fileName: String?) {
@@ -284,6 +292,25 @@ class ReceiveServer(
     private fun selectVoice(out: OutputStream, id: String) {
         if (library.voicePresets().none { it.id == id }) { respond(out, 400, "unknown voice"); return }
         library.putString(LibraryStore.K_FISH_VOICE, id); respondJson(out, settingsJson().toString())
+    }
+
+    private fun castGet(out: OutputStream, fileName: String?) {
+        val b = fileName?.let { parseBook(it) } ?: run { respond(out, 404, "book not found"); return }
+        runCatching { casts.castJson(b) }.fold(
+            onSuccess = { respondJson(out, it.toString()) },
+            onFailure = { respond(out, 422, it.message ?: "Cast unavailable") })
+    }
+
+    private fun castSetVoice(out: OutputStream, body: JSONObject) {
+        val b = parseBook(body.optString("file")) ?: run { respond(out, 404, "book not found"); return }
+        runCatching { casts.setVoice(b, body.optString("role"), body.optString("voice")); casts.castJson(b) }.fold(
+            onSuccess = { respondJson(out, it.toString()) },
+            onFailure = { respond(out, 422, it.message ?: "Could not change the voice") })
+    }
+
+    private fun castReset(out: OutputStream, fileName: String) {
+        val b = parseBook(fileName) ?: run { respond(out, 404, "book not found"); return }
+        casts.reset(b); respondJson(out, "{\"ok\":true}")
     }
 
     private fun previewVoice(out: OutputStream, body: JSONObject) {

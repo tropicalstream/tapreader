@@ -100,7 +100,15 @@
         </div>
 
         <div class="voice-block">
-          <h3>Find a voice on fish.audio</h3>
+          <div class="voice-block-head"><h3>Characters</h3><span class="voice-count" id="cast-status"></span></div>
+          <p class="small-copy">With a Gemini key saved, each book is cast: Gemini works out who says every line and picks a fish.audio voice to suit each character. Choose a book to see its cast; <strong>Change</strong> a voice, then pick one from the search below.</p>
+          <div class="cast-books" id="cast-books"></div>
+          <div class="cast-list" id="cast-list"></div>
+          <button type="button" id="cast-reset" class="delete-voice" hidden>Re-cast this book</button>
+        </div>
+
+        <div class="voice-block">
+          <h3 id="voice-finder-title">Find a voice on fish.audio</h3>
           <form class="voice-finder" id="voice-finder">
             <label class="search-field"><span class="sr-only">Search the fish.audio voice library</span><input id="voice-query" placeholder="Search voices — e.g. calm narrator, deep male, British"></label>
             <button type="submit">Search</button>

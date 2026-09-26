@@ -36,6 +36,22 @@ android {
         jvmTarget = "17"
     }
 
+    testOptions {
+        // Pure-JVM tests of the casting/segmenting/alignment core.
+        unitTests.isReturnDefaultValues = true
+        unitTests.all {
+            it.systemProperty("tapreader.root", rootDir.absolutePath)
+            // ./gradlew testDebugUnitTest -Plive=1 runs the live fish/Gemini tests too.
+            it.systemProperty("tapreader.live", (project.findProperty("live") ?: "").toString())
+            it.systemProperty("tapreader.tune", (project.findProperty("tune") ?: "").toString())
+            it.systemProperty("tapreader.books", (project.findProperty("books") ?: "").toString())
+            it.outputs.upToDateWhen { false }
+            it.testLogging { events("passed", "failed", "skipped"); showStandardStreams = true }
+        }
+    }
+
+    buildFeatures { buildConfig = true }
+
     packaging {
         resources.excludes += setOf(
             "META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*",
@@ -70,5 +86,8 @@ dependencies {
     implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
     implementation("org.slf4j:slf4j-nop:2.0.9")
 
-    // RayNeo X3 Pro SDKs (dual-projection / Mercury launcher integration).
+
+    testImplementation("junit:junit:4.13.2")
+    // Android's org.json is a stub on the JVM; tests need the real thing.
+    testImplementation("org.json:json:20240303")
 }

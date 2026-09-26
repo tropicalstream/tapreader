@@ -212,6 +212,9 @@ class LibraryStore(private val context: Context) {
         // Settings keys.
         const val K_FISH_KEY = "fish_api_key"
         const val K_FISH_VOICE = "fish_voice_id"
+        const val K_GEMINI_KEY = "llm_key_gemini"         // coach + character casting
+        const val K_MULTI_VOICE = "multi_voice"           // a voice per character (needs the Gemini key)
+        const val K_NARRATOR_MINE = "narrator_is_mine"    // true: chosen voice narrates every book
         const val K_MODE = "reader_mode"          // 0 paged, 1 autoscroll, 2 rsvp
         const val K_FONT_SP = "font_sp"
         const val K_WPM = "rsvp_wpm"

@@ -26,14 +26,18 @@ object DocumentParser {
         "epub", "fb2", "pdf", "rtf", "docx"
     )
 
+    /** The [Book.id] a file parses to (casts are stored under it). */
+    fun bookIdFor(fileName: String): String =
+        fileName.substringBeforeLast('.').replace('_', ' ').trim().hashCode().toString()
+
     fun isSupported(name: String): Boolean =
         SUPPORTED.contains(name.substringAfterLast('.', "").lowercase())
 
-    fun parse(context: Context, file: File): Book {
+    fun parse(context: Context?, file: File): Book {
         val ext = file.name.substringAfterLast('.', "").lowercase()
         val fallbackTitle = file.nameWithoutExtension.replace('_', ' ').trim()
         return when (ext) {
-            "pdf" -> parsePdf(context, file, fallbackTitle)
+            "pdf" -> parsePdf(requireNotNull(context) { "PDF parsing needs a Context" }, file, fallbackTitle)
             "epub" -> parseEpub(file, fallbackTitle)
             "docx" -> parseDocx(file, fallbackTitle)
             "fb2" -> fromText(stripTags(file.readText(Charsets.UTF_8)), fallbackTitle, "", "fb2")
@@ -51,7 +55,10 @@ object DocumentParser {
      * look like "Chapter N", roman numerals, or all-caps short lines.
      */
     fun fromText(raw: String, title: String, author: String, format: String): Book {
+        // Non-breaking and typographic spaces are word gaps too (Java's \s misses
+        // them, which glued words together in some EPUBs and broke quote pairing).
         val text = stripGutenbergBoilerplate(raw).replace("\r\n", "\n").replace('\r', '\n')
+            .replace(Regex("[\u00A0\u2000-\u200A\u202F\u205F\u3000]"), " ")
         val words = ArrayList<Word>(text.length / 5)
         val chapterStarts = ArrayList<Int>()
         val chapterTitles = ArrayList<String>()
@@ -380,6 +387,11 @@ object DocumentParser {
         s = s.replace(Regex("(?is)<(script|style|head)[^>]*>.*?</\\1>"), " ")
         s = s.replace(Regex("(?i)</(p|div|br|h[1-6]|li|tr|section|article)\\s*>"), "\n\n")
         s = s.replace(Regex("(?i)<br\\s*/?>"), "\n")
+        // Headings set as images ("<h1><img alt="Chapter 1"></h1>") keep their title.
+        s = s.replace(Regex("(?i)<img[^>]*\\balt=\"((?:chapter|part|book|prologue|epilogue|interlude|act)\\b[^\"]{0,40})\"[^>]*>")) { " ${it.groupValues[1]} " }
+        // Inline tags join, not split: a drop cap is often "“W<i>hat’s" or
+        // "<span class="dropcap">I</span>T is", which must read "What’s" / "IT is".
+        s = s.replace(Regex("(?i)</?(i|b|em|strong|span|a|small|u|s|font|abbr|cite|mark|q)(\\s[^>]*)?/?>"), "")
         s = s.replace(Regex("<[^>]+>"), " ")
         s = decodeEntities(s)
         s = s.replace(Regex("[ \\t]+"), " ")
