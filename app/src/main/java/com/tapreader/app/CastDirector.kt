@@ -160,9 +160,19 @@ class CastDirector(
         return (cast ?: Cast(book.id)).also { it.title = book.title; it.textSig = sig }
     }
 
+    /**
+     * Fingerprint of everything line attributions are keyed on: the words, the
+     * paragraph breaks, and the quote spans found in them. A parser or quote-
+     * detection fix that renumbers the spans (as merging a line-wrapped quote
+     * does) must re-attribute the lines — otherwise every attribution after the
+     * first changed span points at the wrong quote and voices switch mid-scene.
+     */
     private fun signature(book: Book): String {
         var h = book.wordCount.toLong()
-        for (w in book.words.take(4000)) h = h * 31 + w.text.hashCode()
+        for (w in book.words.take(4000)) h = h * 31 + w.text.hashCode() + if (w.paragraphBreak) 7 else 0
+        val spans = Dialogue.analyze(book).spans
+        h = h * 31 + spans.size
+        for (sp in spans) h = h * 31 + sp.startWord * 17 + sp.endWord
         return java.lang.Long.toHexString(h)
     }
 
